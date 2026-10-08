@@ -502,8 +502,8 @@ void LaunchController::onFailed(QString reason)
                 return;
             const auto text = GeminiClient::isConfigured()
                                   ? tr("Похоже, игра вылетела или не запустилась.\nОткрыть ИИ-помощника, чтобы найти и исправить причину?")
-                                  : tr("Похоже, игра вылетела или не запустилась.\nИИ-помощник может найти причину, но сначала добавьте ключ "
-                                       "Gemini в «Настройки → ИИ-помощник». Открыть помощника?");
+                                  : tr("Похоже, игра вылетела или не запустилась.\nИИ-помощник может найти причину, но сначала выберите нейросеть "
+                                       "и добавьте её ключ в «Настройки → ИИ-помощник». Открыть помощника?");
             if (QMessageBox::question(parent, tr("Игра вылетела"), text) != QMessageBox::Yes)
                 return;
             AIAssistantPage::requestAutoAnalyze(instanceId);
