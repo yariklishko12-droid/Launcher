@@ -704,7 +704,7 @@ void AIAssistantPage::requestSuggestions(int count)
                                     catalogue.isEmpty() ? QStringLiteral("(not available — pick from your own knowledge)") : catalogue.join('\n'));
     m_mode = Mode::Suggest;
     if (m_fillRound == 0)
-        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(std::min<int>(m_catalog.size(), m_catalogLimit)));
+        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(std::min(int(m_catalog.size()), m_catalogLimit)));
     else
         setBusy(true, tr("Найдено %1 из %2. ИИ добирает ещё %3…").arg(resolvedCount()).arg(m_target).arg(count));
     m_ai->generate(BUILD_PROMPT, prompt, true);
