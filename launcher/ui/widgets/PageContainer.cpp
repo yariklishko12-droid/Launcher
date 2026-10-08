@@ -56,6 +56,7 @@
 #include "ui/widgets/IconLabel.h"
 
 #include "Application.h"
+#include "ui/Animations.h"
 #include "DesktopServices.h"
 
 class PageEntryFilterModel : public QSortFilterProxyModel {
@@ -231,6 +232,7 @@ void PageContainer::showPage(int row)
     }
     if (m_currentPage) {
         m_pageStack->setCurrentIndex(m_currentPage->stackIndex);
+        Animations::fadeIn(m_pageStack->currentWidget());
         m_header->setText(m_currentPage->displayName());
         m_currentPage->opened();
     } else {
