@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "GeminiClient.h"
 
+#include <QTimer>
+
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkAccessManager>
@@ -38,6 +40,7 @@ QString GeminiClient::currentModel()
 
 void GeminiClient::abort()
 {
+    ++m_generation;
     if (m_reply) {
         auto reply = m_reply;
         m_reply = nullptr;
@@ -52,20 +55,29 @@ void GeminiClient::generate(const QString& systemPrompt, const QString& userProm
         emit failed(tr("Не указан API-ключ Gemini. Откройте «Настройки → ИИ-помощник» и вставьте ключ."));
         return;
     }
+    m_systemPrompt = systemPrompt;
+    m_userPrompt = userPrompt;
+    m_expectJson = expectJson;
+    m_model = currentModel();
+    m_attempt = 0;
+    send();
+}
 
-    const QString model = QString::fromUtf8(QUrl::toPercentEncoding(currentModel()));
+void GeminiClient::send()
+{
+    const QString model = QString::fromUtf8(QUrl::toPercentEncoding(m_model));
     QNetworkRequest request(QUrl(QStringLiteral("https://generativelanguage.googleapis.com/v1beta/models/%1:generateContent").arg(model)));
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
     request.setRawHeader("x-goog-api-key", apiKey().toUtf8());
-    request.setTransferTimeout(180 * 1000);
+    request.setTransferTimeout(240 * 1000);
 
     QJsonObject generationConfig{ { "temperature", 0.2 } };
-    if (expectJson)
+    if (m_expectJson)
         generationConfig["responseMimeType"] = QStringLiteral("application/json");
 
     QJsonObject body{
-        { "systemInstruction", QJsonObject{ { "parts", QJsonArray{ QJsonObject{ { "text", systemPrompt } } } } } },
-        { "contents", QJsonArray{ QJsonObject{ { "role", "user" }, { "parts", QJsonArray{ QJsonObject{ { "text", userPrompt } } } } } } },
+        { "systemInstruction", QJsonObject{ { "parts", QJsonArray{ QJsonObject{ { "text", m_systemPrompt } } } } } },
+        { "contents", QJsonArray{ QJsonObject{ { "role", "user" }, { "parts", QJsonArray{ QJsonObject{ { "text", m_userPrompt } } } } } } },
         { "generationConfig", generationConfig },
     };
 
@@ -79,11 +91,37 @@ void GeminiClient::generate(const QString& systemPrompt, const QString& userProm
         if (!current || reply->error() == QNetworkReply::OperationCanceledError)
             return;
 
+        const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const auto root = QJsonDocument::fromJson(reply->readAll()).object();
         if (reply->error() != QNetworkReply::NoError || root.contains("error")) {
             QString message = root.value("error").toObject().value("message").toString();
             if (message.isEmpty())
                 message = reply->errorString();
+
+            // Overloaded / rate limited / temporary server error: wait and repeat, then fall back to a lighter model.
+            const bool temporary = status == 429 || status == 500 || status == 502 || status == 503 || status == 504 ||
+                                   message.contains("high demand", Qt::CaseInsensitive) ||
+                                   message.contains("overloaded", Qt::CaseInsensitive) ||
+                                   reply->error() == QNetworkReply::TimeoutError;
+            const QString fallback = QStringLiteral("gemini-2.5-flash-lite");
+            if (temporary && (m_attempt < 3 || m_model != fallback)) {
+                ++m_attempt;
+                int delay = 0;
+                if (m_attempt <= 3) {
+                    delay = (m_attempt == 1 ? 5 : m_attempt == 2 ? 15 : 30);
+                    emit retrying(tr("Gemini перегружен, повторяю через %1 с (попытка %2 из 3)…").arg(delay).arg(m_attempt + 1));
+                } else {
+                    m_model = fallback;
+                    delay = 2;
+                    emit retrying(tr("Gemini перегружен, пробую более лёгкую модель %1…").arg(fallback));
+                }
+                const auto generation = m_generation;
+                QTimer::singleShot(delay * 1000, this, [this, generation]() {
+                    if (generation == m_generation)
+                        send();
+                });
+                return;
+            }
             emit failed(tr("Ошибка Gemini: %1").arg(message));
             return;
         }

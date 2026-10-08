@@ -30,7 +30,15 @@ class GeminiClient : public QObject {
    signals:
     void finished(const QString& text);
     void failed(const QString& error);
+    /** Gemini is overloaded and the request will be repeated automatically. */
+    void retrying(const QString& message);
 
    private:
+    void send();
+
     QPointer<QNetworkReply> m_reply;
+    QString m_systemPrompt, m_userPrompt, m_model;
+    bool m_expectJson = true;
+    int m_attempt = 0;
+    quint64 m_generation = 0;  // invalidates pending retry timers after abort()/new request
 };

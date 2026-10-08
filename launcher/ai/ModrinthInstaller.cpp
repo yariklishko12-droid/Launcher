@@ -200,23 +200,104 @@ void ModrinthInstaller::resolve(QList<ModCandidate> candidates)
 {
     m_aborted = false;
     m_busy = true;
-    m_queue = std::move(candidates);
-    m_results.clear();
-    resolveNext();
-}
-
-void ModrinthInstaller::resolveNext()
-{
-    if (m_queue.isEmpty()) {
+    m_results = std::move(candidates);
+    m_resolveIndex = 0;
+    m_resolveActive = 0;
+    if (m_results.isEmpty()) {
         m_busy = false;
         emit resolved(m_results);
         return;
     }
-    auto candidate = m_queue.takeFirst();
-    emit progress(tr("Проверяю на Modrinth: %1").arg(candidate.name.isEmpty() ? candidate.slug : candidate.name));
-    resolveOne(candidate, [this](ModCandidate result) {
-        m_results.append(result);
+    // A few lookups in parallel: a 100-mod pack would otherwise take minutes (Modrinth allows 300 requests/min).
+    for (int i = 0; i < 6; ++i)
         resolveNext();
+}
+
+void ModrinthInstaller::resolveNext()
+{
+    if (m_aborted)
+        return;
+    if (m_resolveIndex >= m_results.size()) {
+        if (m_resolveActive == 0 && m_busy) {
+            m_busy = false;
+            emit resolved(m_results);
+        }
+        return;
+    }
+    const int index = m_resolveIndex++;
+    ++m_resolveActive;
+    const auto candidate = m_results[index];
+    emit progress(tr("Проверяю на Modrinth (%1 из %2): %3")
+                      .arg(index + 1)
+                      .arg(m_results.size())
+                      .arg(candidate.name.isEmpty() ? candidate.slug : candidate.name));
+    resolveOne(candidate, [this, index](ModCandidate result) {
+        if (index < m_results.size())
+            m_results[index] = result;
+        --m_resolveActive;
+        resolveNext();
+    });
+}
+
+void ModrinthInstaller::fetchCatalog(int maxEntries)
+{
+    m_aborted = false;
+    m_busy = true;
+    m_catalog.clear();
+    fetchCatalogPage(0, maxEntries);
+}
+
+void ModrinthInstaller::fetchCatalogPage(int offset, int maxEntries)
+{
+    emit progress(tr("Загружаю список модов для Minecraft %1 (%2)… %3").arg(m_mcVersion, m_loader).arg(m_catalog.size()));
+    QUrl url(API + "/search");
+    QUrlQuery query;
+    query.addQueryItem("index", "downloads");
+    query.addQueryItem("limit", "100");
+    query.addQueryItem("offset", QString::number(offset));
+    QJsonArray loaders;
+    for (const auto& l : loaderList())
+        loaders.append("categories:" + l);
+    const QJsonArray facets{ QJsonArray{ "project_type:mod" }, QJsonArray{ "versions:" + m_mcVersion }, loaders };
+    query.addQueryItem("facets", QString::fromUtf8(QJsonDocument(facets).toJson(QJsonDocument::Compact)));
+    url.setQuery(query);
+
+    request(url, [this, offset, maxEntries](QNetworkReply* reply) {
+        const auto root = QJsonDocument::fromJson(reply->readAll()).object();
+        const auto hits = root.value("hits").toArray();
+        if (reply->error() == QNetworkReply::NoError) {
+            static const QSet<QString> skipCategories = { "fabric", "forge", "neoforge", "quilt", "liteloader", "modloader", "rift" };
+            for (const auto& value : hits) {
+                const auto hit = value.toObject();
+                QStringList categories;
+                bool library = false;
+                for (const auto& c : hit.value("categories").toArray()) {
+                    const auto name = c.toString();
+                    if (name == "library")
+                        library = true;
+                    else if (!skipCategories.contains(name))
+                        categories << name;
+                }
+                if (library && categories.isEmpty())
+                    continue;  // pure libraries are installed automatically as dependencies
+                CatalogEntry entry;
+                entry.slug = hit.value("slug").toString();
+                entry.title = hit.value("title").toString();
+                entry.description = hit.value("description").toString().simplified().left(90);
+                entry.categories = categories;
+                entry.downloads = hit.value("downloads").toInt();
+                if (!entry.slug.isEmpty())
+                    m_catalog << entry;
+            }
+        }
+        const int total = root.value("total_hits").toInt();
+        const int next = offset + 100;
+        if (reply->error() == QNetworkReply::NoError && !hits.isEmpty() && next < total && next < maxEntries) {
+            fetchCatalogPage(next, maxEntries);
+            return;
+        }
+        m_busy = false;
+        emit catalogReady(m_catalog);  // an empty catalog is not fatal: the AI then picks from memory
     });
 }
 
