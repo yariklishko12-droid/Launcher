@@ -168,7 +168,7 @@ void AIAssistantPage::buildUi()
     m_keyBanner->setObjectName("aiKeyBanner");
     m_keyBanner->setStyleSheet("#aiKeyBanner { background: rgba(155,109,255,0.15); border: 1px solid #9b6dff; border-radius: 8px; }");
     auto bannerLayout = new QHBoxLayout(m_keyBanner);
-    auto bannerText = new QLabel(tr("Чтобы помощник заработал, добавьте бесплатный API-ключ Gemini."), m_keyBanner);
+    auto bannerText = new QLabel(tr("Чтобы помощник заработал, выберите нейросеть и добавьте её ключ (у Gemini и Groq есть бесплатные)."), m_keyBanner);
     bannerText->setWordWrap(true);
     auto bannerButton = accentButton(tr("Открыть настройки ИИ"), m_keyBanner);
     connect(bannerButton, &QPushButton::clicked, this, [this]() {
@@ -277,7 +277,7 @@ void AIAssistantPage::refreshHeader()
     m_header->setText(tr("<span style='font-size:15px'><b>%1</b></span> &nbsp;·&nbsp; Minecraft %2 &nbsp;·&nbsp; %3 &nbsp;·&nbsp; "
                          "модов включено: %4 &nbsp;·&nbsp; <span style='color:#a9a9b6'>%5</span>")
                           .arg(m_instance->name().toHtmlEscaped(), mcVersion(),
-                               loaderName.isEmpty() ? tr("без загрузчика") : loaderName, QString::number(mods), GeminiClient::currentModel()));
+                               loaderName.isEmpty() ? tr("без загрузчика") : loaderName, QString::number(mods), GeminiClient::displayName().toHtmlEscaped()));
     m_keyBanner->setVisible(!GeminiClient::isConfigured());
     if (loaderName.isEmpty() && m_status->text().isEmpty())
         m_status->setText(tr("В сборке нет загрузчика модов. Установите Fabric, Forge, NeoForge или Quilt на вкладке «Версия»."));
@@ -310,6 +310,21 @@ void AIAssistantPage::onAiFailed(const QString& error)
 {
     const auto mode = m_mode;
     m_mode = Mode::Idle;
+    // The service rejected the request as too large: send less data instead of giving up.
+    if (m_ai->lastErrorTooLarge()) {
+        if (mode == Mode::Diagnose && m_shrink < 16) {
+            m_shrink *= 4;
+            m_mode = Mode::Diagnose;
+            m_status->setText(tr("Запрос слишком большой для этой модели, отправляю сокращённые логи…"));
+            sendDiagnosisRequest();
+            return;
+        }
+        if (mode == Mode::Suggest && m_catalogLimit > 30) {
+            m_catalogLimit = std::max(25, m_catalogLimit / 3);
+            requestSuggestions(m_lastCount);
+            return;
+        }
+    }
     if (mode == Mode::Suggest && resolvedCount() > 0) {
         showSuggestions(error);  // keep the mods found in earlier rounds
         return;
@@ -382,15 +397,15 @@ QString AIAssistantPage::collectLogs() const
     if (!reports.isEmpty()) {
         crash = QStringLiteral("File: %1 (modified %2)\n%3")
                     .arg(reports.first().fileName(), reports.first().lastModified().toString(Qt::ISODate),
-                         tail(readFile(reports.first().absoluteFilePath()), 30000));
+                         tail(readFile(reports.first().absoluteFilePath()), 30000 / m_shrink));
     }
     QString hsErr;  // native JVM crash
     const auto jvmLogs = QDir(m_instance->gameRoot()).entryInfoList({ "hs_err_pid*.log" }, QDir::Files, QDir::Time);
     if (!jvmLogs.isEmpty())
-        hsErr = tail(readFile(jvmLogs.first().absoluteFilePath()), 8000);
+        hsErr = tail(readFile(jvmLogs.first().absoluteFilePath()), 8000 / m_shrink);
 
     return GeminiClient::redact(QStringLiteral("=== Launcher / game log (tail) ===\n%1\n\n=== Latest crash report ===\n%2\n\n=== JVM crash log ===\n%3")
-                                    .arg(log.isEmpty() ? "(none)" : tail(log, 60000), crash.isEmpty() ? "(none)" : crash,
+                                    .arg(log.isEmpty() ? "(none)" : tail(log, 60000 / m_shrink), crash.isEmpty() ? "(none)" : crash,
                                          hsErr.isEmpty() ? "(none)" : hsErr));
 }
 
@@ -402,11 +417,12 @@ void AIAssistantPage::analyze()
         return;
     refreshHeader();
     if (!GeminiClient::isConfigured()) {
-        m_status->setText(tr("Сначала добавьте API-ключ Gemini в настройках."));
+        m_status->setText(tr("Сначала выберите нейросеть и добавьте её ключ в «Настройки → ИИ-помощник»."));
         return;
     }
     m_fixList->clear();
     m_diagnosis->clear();
+    m_shrink = GeminiClient::provider().catalogSize <= 100 ? 4 : 1;
     m_mode = Mode::Diagnose;
     setBusy(true, tr("Проверяю моды и их зависимости…"));
 
@@ -622,7 +638,7 @@ void AIAssistantPage::suggestMods()
         return;
     }
     if (!GeminiClient::isConfigured()) {
-        m_status->setText(tr("Сначала добавьте API-ключ Gemini в настройках."));
+        m_status->setText(tr("Сначала выберите нейросеть и добавьте её ключ в «Настройки → ИИ-помощник»."));
         return;
     }
     m_modList->clear();
@@ -640,9 +656,11 @@ void AIAssistantPage::suggestMods()
     if (match.hasMatch())
         m_target = std::clamp(match.captured(1).toInt(), 1, 200);
 
+    const int budget = GeminiClient::provider().catalogSize;
+    m_catalogLimit = std::min(600, m_target > 60 ? budget * 3 / 2 : budget);
     recreateInstaller();
     setBusy(true, tr("Загружаю список модов, доступных для Minecraft %1…").arg(mcVersion()));
-    m_installer->fetchCatalog(m_target > 60 ? 600 : 400);
+    m_installer->fetchCatalog(m_catalogLimit);
 }
 
 void AIAssistantPage::onCatalog(const QList<CatalogEntry>& entries)
@@ -663,8 +681,9 @@ void AIAssistantPage::requestSuggestions(int count)
         if (!c.resolved)
             unavailable << (c.slug.isEmpty() ? c.name : c.slug);
     }
+    m_lastCount = count;
     QStringList catalogue;
-    for (const auto& e : m_catalog)
+    for (const auto& e : m_catalog.mid(0, m_catalogLimit))
         catalogue << QStringLiteral("%1 | %2 | %3 | %4").arg(e.slug, e.title, e.categories.join(','), e.description);
 
     QString amountText;
@@ -685,7 +704,7 @@ void AIAssistantPage::requestSuggestions(int count)
                                     catalogue.isEmpty() ? QStringLiteral("(not available — pick from your own knowledge)") : catalogue.join('\n'));
     m_mode = Mode::Suggest;
     if (m_fillRound == 0)
-        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(m_catalog.size()));
+        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(std::min<int>(m_catalog.size(), m_catalogLimit)));
     else
         setBusy(true, tr("Найдено %1 из %2. ИИ добирает ещё %3…").arg(resolvedCount()).arg(m_target).arg(count));
     m_ai->generate(BUILD_PROMPT, prompt, true);

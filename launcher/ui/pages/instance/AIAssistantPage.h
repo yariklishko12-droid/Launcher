@@ -91,6 +91,9 @@ class AIAssistantPage : public QWidget, public BasePage {
     QString m_buildRequest;
     int m_target = 0;
     int m_fillRound = 0;
+    int m_catalogLimit = 400;  // catalogue entries sent to the AI (smaller for services with small limits)
+    int m_lastCount = 0;       // amount asked for in the last suggestion request
+    int m_shrink = 1;          // log size divisor for services with small limits
     QSet<QString> m_triedSlugs;
     QList<QJsonObject> m_pendingInstallActions;
 
