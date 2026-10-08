@@ -948,6 +948,8 @@ SET(LAUNCHER_SOURCES
     ai/GeminiClient.h
     ai/ModrinthInstaller.cpp
     ai/ModrinthInstaller.h
+    ai/DependencyScanner.cpp
+    ai/DependencyScanner.h
     ui/pages/instance/LogPage.cpp
     ui/pages/instance/LogPage.h
     ui/pages/instance/InstanceSettingsPage.h
