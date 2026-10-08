@@ -57,7 +57,9 @@
 #include "ui/instanceview/AccessibleInstanceView.h"
 
 #include "ui/pages/BasePageProvider.h"
+#include "ui/pages/global/AIPage.h"
 #include "ui/pages/global/APIPage.h"
+#include "ui/Animations.h"
 #include "ui/pages/global/AccountListPage.h"
 #include "ui/pages/global/AppearancePage.h"
 #include "ui/pages/global/ExternalToolsPage.h"
@@ -910,6 +912,12 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
         }
         m_settings->registerSetting("FallbackMRBlockedMods", true);
         m_settings->registerSetting("ModrinthToken", "");
+
+        // AI assistant (Gemini) and interface
+        m_settings->registerSetting("GeminiApiKey", "");
+        m_settings->registerSetting("GeminiModel", "gemini-2.5-flash");
+        m_settings->registerSetting("AIOfferOnCrash", true);
+        m_settings->registerSetting("UIAnimations", true);
         m_settings->registerSetting("UserAgentOverride", "");
 
         // FTBApp instances
@@ -927,6 +935,7 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
             m_globalSettingsProvider->addPage<MinecraftPage>();
             m_globalSettingsProvider->addPage<JavaPage>();
             m_globalSettingsProvider->addPage<AccountListPage>();
+            m_globalSettingsProvider->addPage<AIPage>();
             m_globalSettingsProvider->addPage<APIPage>();
             m_globalSettingsProvider->addPage<ExternalToolsPage>();
             m_globalSettingsProvider->addPage<ProxyPage>();
@@ -966,6 +975,7 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
 
     // Themes
     m_themeManager = std::make_unique<ThemeManager>();
+    Animations::installWindowFade(this);
 
 #ifdef Q_OS_MACOS
     // for macOS: getting directory settings will generate URL security-scoped bookmarks if needed and not present
@@ -1255,12 +1265,8 @@ bool Application::createSetupWizard()
         if (!validIcons)
             settings()->set("IconTheme", QString("pe_colored"));
         if (!validWidgets) {
-#if defined(Q_OS_WIN32) && QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
-            const QString style =
-                QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark ? QStringLiteral("dark") : QStringLiteral("bright");
-#else
-            const QString style = QStringLiteral("system");
-#endif
+            // New installs start with the Pixel Dark theme.
+            const QString style = QStringLiteral("pixel_dark");
 
             settings()->set("ApplicationTheme", style);
         }

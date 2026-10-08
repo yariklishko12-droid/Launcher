@@ -4,6 +4,7 @@
 #include "minecraft/MinecraftInstance.h"
 #include "ui/pages/BasePage.h"
 #include "ui/pages/BasePageProvider.h"
+#include "ui/pages/instance/AIAssistantPage.h"
 #include "ui/pages/instance/InstanceSettingsPage.h"
 #include "ui/pages/instance/LogPage.h"
 #include "ui/pages/instance/ManagedPackPage.h"
@@ -29,6 +30,7 @@ class InstancePageProvider : protected QObject, public BasePageProvider {
         QList<BasePage*> values;
         values.append(new LogPage(inst));
         MinecraftInstance* onesix = dynamic_cast<MinecraftInstance*>(inst);
+        values.append(new AIAssistantPage(onesix));
         values.append(new VersionPage(onesix));
         values.append(ManagedPackPage::createPage(onesix));
         auto modsPage = new ModFolderPage(onesix, onesix->loaderModList());

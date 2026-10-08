@@ -45,6 +45,13 @@
 
 #include "net/NetUtils.h"
 #include "ui/InstanceWindow.h"
+#include "ui/pages/instance/AIAssistantPage.h"
+#include "ai/GeminiClient.h"
+#include <QMessageBox>
+#include <QPointer>
+#include <QTimer>
+#include "minecraft/MinecraftInstance.h"
+#include "InstanceList.h"
 #include "ui/dialogs/CustomMessageBox.h"
 #include "ui/dialogs/MSALoginDialog.h"
 #include "ui/dialogs/ProfileSelectDialog.h"
@@ -484,6 +491,24 @@ void LaunchController::onFailed(QString reason)
 {
     if (m_instance->settings()->get("ShowConsoleOnError").toBool()) {
         APPLICATION->showInstanceWindow(m_instance, "console");
+    }
+    if (APPLICATION->settings()->get("AIOfferOnCrash").toBool() && dynamic_cast<MinecraftInstance*>(m_instance)) {
+        // Ask after the failure has been reported, so the launch task can finish cleanly.
+        const QString instanceId = m_instance->id();
+        QPointer<QWidget> parent = m_parentWidget;
+        QTimer::singleShot(0, APPLICATION, [instanceId, parent]() {
+            auto instance = APPLICATION->instances()->getInstanceById(instanceId);
+            if (!instance)
+                return;
+            const auto text = GeminiClient::isConfigured()
+                                  ? tr("Похоже, игра вылетела или не запустилась.\nОткрыть ИИ-помощника, чтобы найти и исправить причину?")
+                                  : tr("Похоже, игра вылетела или не запустилась.\nИИ-помощник может найти причину, но сначала добавьте ключ "
+                                       "Gemini в «Настройки → ИИ-помощник». Открыть помощника?");
+            if (QMessageBox::question(parent, tr("Игра вылетела"), text) != QMessageBox::Yes)
+                return;
+            AIAssistantPage::requestAutoAnalyze(instanceId);
+            APPLICATION->showInstanceWindow(instance, "ai-assistant");
+        });
     }
     emitFailed(std::move(reason));
 }

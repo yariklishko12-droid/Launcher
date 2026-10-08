@@ -887,6 +887,10 @@ SET(LAUNCHER_SOURCES
     ui/themes/CustomTheme.h
     ui/themes/DarkTheme.cpp
     ui/themes/DarkTheme.h
+    ui/themes/PixelDarkTheme.cpp
+    ui/themes/PixelDarkTheme.h
+    ui/Animations.cpp
+    ui/Animations.h
     ui/themes/ITheme.cpp
     ui/themes/ITheme.h
     ui/themes/HintOverrideProxyStyle.cpp
@@ -938,6 +942,12 @@ SET(LAUNCHER_SOURCES
     ui/pages/instance/ModFolderPage.h
     ui/pages/instance/NotesPage.cpp
     ui/pages/instance/NotesPage.h
+    ui/pages/instance/AIAssistantPage.cpp
+    ui/pages/instance/AIAssistantPage.h
+    ai/GeminiClient.cpp
+    ai/GeminiClient.h
+    ai/ModrinthInstaller.cpp
+    ai/ModrinthInstaller.h
     ui/pages/instance/LogPage.cpp
     ui/pages/instance/LogPage.h
     ui/pages/instance/InstanceSettingsPage.h
@@ -973,6 +983,8 @@ SET(LAUNCHER_SOURCES
     ui/pages/global/ProxyPage.h
     ui/pages/global/APIPage.cpp
     ui/pages/global/APIPage.h
+    ui/pages/global/AIPage.cpp
+    ui/pages/global/AIPage.h
 
     # GUI - platform pages
     ui/pages/modplatform/CustomPage.cpp
