@@ -7,6 +7,7 @@
 #include <QSet>
 #include <QWidget>
 
+#include "ai/DependencyScanner.h"
 #include "ai/ModrinthInstaller.h"
 #include "ui/pages/BasePage.h"
 
@@ -51,6 +52,8 @@ class AIAssistantPage : public QWidget, public BasePage {
 
     // repair
     void analyze();
+    void sendDiagnosisRequest();
+    void repairDependencies();
     void onDiagnosis(const QString& text);
     void applySelectedFixes();
     bool setModEnabled(const QString& fileName, bool enabled);
@@ -85,6 +88,8 @@ class AIAssistantPage : public QWidget, public BasePage {
     QFrame* m_keyBanner;
     QTabWidget* m_tabs;
     QPushButton* m_analyzeButton;
+    QPushButton* m_depsButton;
+    DependencyScanner::Result m_scan;
     QTextBrowser* m_diagnosis;
     QListWidget* m_fixList;
     QPushButton* m_applyButton;

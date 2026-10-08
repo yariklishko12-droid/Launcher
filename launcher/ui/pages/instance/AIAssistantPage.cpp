@@ -5,6 +5,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFrame>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -180,6 +182,10 @@ void AIAssistantPage::buildUi()
     repairHint->setWordWrap(true);
     m_analyzeButton = accentButton(tr("Найти и исправить проблему"), repair);
     connect(m_analyzeButton, &QPushButton::clicked, this, &AIAssistantPage::analyze);
+    m_depsButton = new QPushButton(tr("Докачать недостающие зависимости"), repair);
+    m_depsButton->setCursor(Qt::PointingHandCursor);
+    m_depsButton->setToolTip(tr("Читает файлы модов и скачивает с Modrinth библиотеки, без которых они не запускаются"));
+    connect(m_depsButton, &QPushButton::clicked, this, &AIAssistantPage::repairDependencies);
     m_diagnosis = new QTextBrowser(repair);
     m_diagnosis->setOpenExternalLinks(true);
     m_diagnosis->setPlaceholderText(tr("Здесь появится диагноз."));
@@ -191,7 +197,10 @@ void AIAssistantPage::buildUi()
 
     auto repairTop = new QHBoxLayout();
     repairTop->addWidget(repairHint, 1);
-    repairTop->addWidget(m_analyzeButton);
+    auto repairButtons = new QVBoxLayout();
+    repairButtons->addWidget(m_analyzeButton);
+    repairButtons->addWidget(m_depsButton);
+    repairTop->addLayout(repairButtons);
     repairLayout->addLayout(repairTop);
     repairLayout->addWidget(m_diagnosis, 3);
     repairLayout->addWidget(new QLabel(tr("<b>Предлагаемые действия</b>"), repair));
@@ -268,6 +277,7 @@ void AIAssistantPage::refreshHeader()
 void AIAssistantPage::setBusy(bool busy, const QString& status)
 {
     m_analyzeButton->setEnabled(!busy);
+    m_depsButton->setEnabled(!busy && !loader().isEmpty());
     m_suggestButton->setEnabled(!busy);
     m_applyButton->setEnabled(!busy && m_fixList->count() > 0);
     m_installButton->setEnabled(!busy && m_modList->count() > 0);
@@ -383,20 +393,54 @@ void AIAssistantPage::analyze()
     m_fixList->clear();
     m_diagnosis->clear();
     m_mode = Mode::Diagnose;
+    setBusy(true, tr("Проверяю моды и их зависимости…"));
+
+    auto watcher = new QFutureWatcher<DependencyScanner::Result>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher]() {
+        watcher->deleteLater();
+        if (m_mode != Mode::Diagnose)
+            return;  // cancelled
+        m_scan = watcher->result();
+        sendDiagnosisRequest();
+    });
+    const QString modsDir = m_instance->modsRoot();
+    watcher->setFuture(QtConcurrent::run([modsDir]() { return DependencyScanner::scan(modsDir); }));
+}
+
+void AIAssistantPage::sendDiagnosisRequest()
+{
     setBusy(true, tr("Читаю логи и спрашиваю ИИ… Обычно это занимает 10–40 секунд."));
+    QStringList missing;
+    for (auto it = m_scan.missing.cbegin(); it != m_scan.missing.cend(); ++it)
+        missing << QStringLiteral("%1 (required by: %2)%3")
+                       .arg(it.key(), it.value().join(", "),
+                            m_scan.disabledProviders.contains(it.key()) ? " — present but DISABLED: " + m_scan.disabledProviders[it.key()] : "");
 
     auto settings = m_instance->settings();
-    const QString prompt = QStringLiteral("Instance: %1\nMinecraft: %2\nMod loader: %3\nMax memory: %4 MB\nJava: %5\n\nMods folder:\n%6\n\n%7")
-                               .arg(m_instance->name(), mcVersion(), loader().isEmpty() ? "none (vanilla)" : loader(),
-                                    settings->get("MaxMemAlloc").toString(), settings->get("JavaVersion").toString(), modListText(),
-                                    collectLogs());
+    const QString prompt =
+        QStringLiteral("Instance: %1\nMinecraft: %2\nMod loader: %3\nMax memory: %4 MB\nJava: %5\n\n"
+                       "Missing required dependencies detected by the launcher from the jar metadata (already handled automatically, "
+                       "do NOT repeat them as actions):\n%6\n\nMods folder:\n%7\n\n%8")
+            .arg(m_instance->name(), mcVersion(), loader().isEmpty() ? "none (vanilla)" : loader(), settings->get("MaxMemAlloc").toString(),
+                 settings->get("JavaVersion").toString(), missing.isEmpty() ? "(none)" : missing.join('\n'), modListText(), collectLogs());
     m_ai->generate(FIX_PROMPT, prompt, true);
+}
+
+void AIAssistantPage::repairDependencies()
+{
+    if (m_mode != Mode::Idle || (m_installer && m_installer->busy()))
+        return;
+    if (loader().isEmpty()) {
+        m_status->setText(tr("В сборке нет загрузчика модов."));
+        return;
+    }
+    startInstall({}, tr("Проверяю зависимости модов…"));
 }
 
 void AIAssistantPage::onDiagnosis(const QString& text)
 {
     QString error;
-    const auto json = GeminiClient::parseJsonObject(text, &error);
+    auto json = GeminiClient::parseJsonObject(text, &error);
     if (json.isEmpty()) {
         setBusy(false, error);
         m_diagnosis->setPlainText(text);
@@ -405,6 +449,22 @@ void AIAssistantPage::onDiagnosis(const QString& text)
 
     QString markdown = json.value("diagnosis").toString();
     const QDir modsDir(m_instance->modsRoot());
+
+    // Dependencies that are definitely missing (read from the jars) go first and do not depend on the AI.
+    for (auto it = m_scan.missing.cbegin(); it != m_scan.missing.cend(); ++it) {
+        QJsonObject action;
+        const auto requiredBy = it.value().join(", ");
+        if (m_scan.disabledProviders.contains(it.key())) {
+            action = { { "type", "enable_mod" }, { "file", m_scan.disabledProviders.value(it.key()) }, { "reason", tr("нужен для: %1").arg(requiredBy) } };
+        } else {
+            const auto slug = DependencyScanner::modrinthSlugFor(it.key());
+            action = { { "type", "install_mod" }, { "slug", slug }, { "name", it.key() }, { "reason", tr("не хватает, нужен для: %1").arg(requiredBy) } };
+        }
+        auto actions = json.value("actions").toArray();
+        actions.prepend(action);
+        json["actions"] = actions;
+    }
+    QSet<QString> seenSlugs, seenFiles;
     for (const auto& value : json.value("actions").toArray()) {
         const auto action = value.toObject();
         const auto type = action.value("type").toString();
@@ -420,6 +480,9 @@ void AIAssistantPage::onDiagnosis(const QString& text)
             label = tr("Отключить мод «%1»").arg(file);
             valid = modsDir.exists(file);
         } else if (type == "enable_mod") {
+            if (seenFiles.contains(file))
+                continue;
+            seenFiles.insert(file);
             label = tr("Включить мод «%1»").arg(file);
             valid = modsDir.exists(file) || modsDir.exists(file + ".disabled");
         } else if (type == "update_mod") {
@@ -427,6 +490,10 @@ void AIAssistantPage::onDiagnosis(const QString& text)
             valid = modsDir.exists(file);
         } else if (type == "install_mod") {
             label = tr("Установить с Modrinth: %1").arg(action.value("name").toString(action.value("slug").toString()));
+            const auto slug = action.value("slug").toString().toLower();
+            if (slug.isEmpty() || seenSlugs.contains(slug))
+                continue;  // duplicate (e.g. the scanner already found this dependency)
+            seenSlugs.insert(slug);
         } else if (type == "set_memory") {
             label = tr("Выделить игре %1 МБ памяти").arg(action.value("mb").toInt());
             valid = action.value("mb").toInt() >= 512;
