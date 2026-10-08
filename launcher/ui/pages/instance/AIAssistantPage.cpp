@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "AIAssistantPage.h"
 
+#include <algorithm>
+
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
@@ -15,6 +17,7 @@
 #include <QMessageBox>
 #include <QPlainTextEdit>
 #include <QProgressBar>
+#include <QRegularExpression>
 #include <QPushButton>
 #include <QTabWidget>
 #include <QTextBrowser>
@@ -68,15 +71,20 @@ const char* BUILD_PROMPT = R"(You are an expert Minecraft: Java Edition modpack 
 Given the player's request, the Minecraft version, the mod loader and the already installed mods, pick mods from Modrinth that:
 - have builds for EXACTLY this Minecraft version and loader;
 - are mutually compatible (e.g. never Sodium together with OptiFine/Embeddium/Rubidium, only one minimap, only one recipe viewer);
-- do not duplicate installed mods or each other.
+- do not duplicate installed mods, already chosen mods or each other.
+You get a CATALOGUE of mods that are guaranteed to have a build for this version and loader. Prefer mods from the catalogue
+(use their slugs exactly). You may add mods that are not in the catalogue only if you are sure they exist on Modrinth for this version.
+Never suggest mods from the "unavailable" list.
 Do NOT list pure library dependencies (Fabric API, Cloth Config, Architectury, etc.) unless the player asked for them: the launcher installs required dependencies automatically.
+If a number of mods is requested, return exactly that many (fill the rest with the best fitting quality-of-life, performance,
+content or decoration mods that match the theme).
 
 Respond ONLY with a JSON object:
 {
   "summary": "short description of the resulting pack, in Russian, Markdown allowed",
-  "mods": [ {"slug": "<Modrinth project slug>", "name": "<display name>", "reason": "<one short sentence in Russian>"} ]
+  "mods": [ {"slug": "<Modrinth project slug>", "name": "<display name>", "reason": "<very short reason in Russian, max 8 words>"} ]
 }
-At most 40 mods. Only use Modrinth slugs you are confident exist.)";
+At most 200 mods.)";
 
 QString tail(const QString& text, int maxChars)
 {
@@ -108,6 +116,7 @@ AIAssistantPage::AIAssistantPage(MinecraftInstance* instance, QWidget* parent) :
     m_ai = new GeminiClient(this);
     connect(m_ai, &GeminiClient::finished, this, &AIAssistantPage::onAiFinished);
     connect(m_ai, &GeminiClient::failed, this, &AIAssistantPage::onAiFailed);
+    connect(m_ai, &GeminiClient::retrying, this, [this](const QString& msg) { m_status->setText(msg); });
     buildUi();
     s_pages.append(this);
 }
@@ -299,7 +308,12 @@ void AIAssistantPage::onAiFinished(const QString& text)
 
 void AIAssistantPage::onAiFailed(const QString& error)
 {
+    const auto mode = m_mode;
     m_mode = Mode::Idle;
+    if (mode == Mode::Suggest && resolvedCount() > 0) {
+        showSuggestions(error);  // keep the mods found in earlier rounds
+        return;
+    }
     setBusy(false, error);
     refreshHeader();
 }
@@ -311,6 +325,7 @@ void AIAssistantPage::recreateInstaller()
     m_installer = new ModrinthInstaller(mcVersion(), loader(), m_instance->modsRoot(), this);
     connect(m_installer, &ModrinthInstaller::progress, this, [this](const QString& msg) { m_status->setText(msg); });
     connect(m_installer, &ModrinthInstaller::resolved, this, &AIAssistantPage::onResolved);
+    connect(m_installer, &ModrinthInstaller::catalogReady, this, &AIAssistantPage::onCatalog);
     connect(m_installer, &ModrinthInstaller::installFinished, this, &AIAssistantPage::onInstallFinished);
 }
 
@@ -613,10 +628,66 @@ void AIAssistantPage::suggestMods()
     m_modList->clear();
     m_summary->clear();
     m_resolved.clear();
+    m_catalog.clear();
+    m_triedSlugs.clear();
+    m_fillRound = 0;
+    m_buildRequest = request;
+
+    // "сборку на 100 модов", "100 mods", "50 шт" -> the AI is asked for exactly that many and tops the list up.
+    m_target = 0;
+    static const QRegularExpression amount(QStringLiteral(R"((\d{1,3})\s*(мод|mod|шт))"), QRegularExpression::CaseInsensitiveOption);
+    const auto match = amount.match(request);
+    if (match.hasMatch())
+        m_target = std::clamp(match.captured(1).toInt(), 1, 200);
+
+    recreateInstaller();
+    setBusy(true, tr("Загружаю список модов, доступных для Minecraft %1…").arg(mcVersion()));
+    m_installer->fetchCatalog(m_target > 60 ? 600 : 400);
+}
+
+void AIAssistantPage::onCatalog(const QList<CatalogEntry>& entries)
+{
+    m_catalog = entries;
+    requestSuggestions(m_target);
+}
+
+void AIAssistantPage::requestSuggestions(int count)
+{
+    QStringList chosen;
+    for (const auto& c : m_resolved) {
+        if (c.resolved)
+            chosen << QStringLiteral("%1 (%2)").arg(c.title, c.slug);
+    }
+    QStringList unavailable;
+    for (const auto& c : m_resolved) {
+        if (!c.resolved)
+            unavailable << (c.slug.isEmpty() ? c.name : c.slug);
+    }
+    QStringList catalogue;
+    for (const auto& e : m_catalog)
+        catalogue << QStringLiteral("%1 | %2 | %3 | %4").arg(e.slug, e.title, e.categories.join(','), e.description);
+
+    QString amountText;
+    if (count > 0 && m_fillRound > 0)
+        amountText = QStringLiteral("Suggest exactly %1 MORE mods (in addition to the already chosen ones).").arg(count);
+    else if (count > 0)
+        amountText = QStringLiteral("The player wants %1 mods: return exactly %1.").arg(count);
+    else
+        amountText = QStringLiteral("Choose a sensible amount (usually 20-50) for this request.");
+
+    const QString prompt = QStringLiteral(
+                               "Player request: %1\n\nMinecraft: %2\nMod loader: %3\n%4\n\nAlready installed:\n%5\n\n"
+                               "Already chosen (do not repeat):\n%6\n\nUnavailable for this version (never suggest):\n%7\n\n"
+                               "CATALOGUE (slug | name | categories | description), sorted by popularity:\n%8")
+                               .arg(m_buildRequest, mcVersion(), loader(), amountText, modListText(),
+                                    chosen.isEmpty() ? QStringLiteral("(none)") : chosen.join('\n'),
+                                    unavailable.isEmpty() ? QStringLiteral("(none)") : unavailable.join(", "),
+                                    catalogue.isEmpty() ? QStringLiteral("(not available — pick from your own knowledge)") : catalogue.join('\n'));
     m_mode = Mode::Suggest;
-    setBusy(true, tr("ИИ подбирает моды…"));
-    const QString prompt = QStringLiteral("Player request: %1\n\nMinecraft: %2\nMod loader: %3\n\nAlready installed:\n%4")
-                               .arg(request, mcVersion(), loader(), modListText());
+    if (m_fillRound == 0)
+        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(m_catalog.size()));
+    else
+        setBusy(true, tr("Найдено %1 из %2. ИИ добирает ещё %3…").arg(resolvedCount()).arg(m_target).arg(count));
     m_ai->generate(BUILD_PROMPT, prompt, true);
 }
 
@@ -625,23 +696,33 @@ void AIAssistantPage::onSuggestions(const QString& text)
     QString error;
     const auto json = GeminiClient::parseJsonObject(text, &error);
     if (json.isEmpty()) {
-        setBusy(false, error);
+        if (resolvedCount() > 0)
+            showSuggestions(error);
+        else
+            setBusy(false, error);
         return;
     }
-    m_summary->setMarkdown(json.value("summary").toString());
+    if (m_fillRound == 0)
+        m_summary->setMarkdown(json.value("summary").toString());
 
     QList<ModCandidate> candidates;
     for (const auto& value : json.value("mods").toArray()) {
         const auto obj = value.toObject();
         ModCandidate candidate;
-        candidate.slug = obj.value("slug").toString();
+        candidate.slug = obj.value("slug").toString().trimmed();
         candidate.name = obj.value("name").toString();
         candidate.reason = obj.value("reason").toString();
-        if (!candidate.slug.isEmpty() || !candidate.name.isEmpty())
-            candidates << candidate;
+        const auto key = (candidate.slug.isEmpty() ? candidate.name : candidate.slug).toLower();
+        if (key.isEmpty() || m_triedSlugs.contains(key))
+            continue;
+        m_triedSlugs.insert(key);
+        candidates << candidate;
     }
     if (candidates.isEmpty()) {
-        setBusy(false, tr("ИИ не предложил ни одного мода. Попробуйте описать запрос иначе."));
+        if (resolvedCount() > 0)
+            showSuggestions();
+        else
+            setBusy(false, tr("ИИ не предложил ни одного мода. Попробуйте описать запрос иначе."));
         return;
     }
     recreateInstaller();
@@ -649,30 +730,72 @@ void AIAssistantPage::onSuggestions(const QString& text)
     m_installer->resolve(candidates);
 }
 
+int AIAssistantPage::resolvedCount() const
+{
+    int ok = 0;
+    for (const auto& c : m_resolved)
+        ok += c.resolved ? 1 : 0;
+    return ok;
+}
+
 void AIAssistantPage::onResolved(const QList<ModCandidate>& candidates)
 {
-    m_resolved = candidates;
+    QSet<QString> projects;
+    for (const auto& c : m_resolved) {
+        if (c.resolved)
+            projects.insert(c.projectId);
+    }
+    int newOk = 0;
+    for (auto c : candidates) {
+        if (c.resolved && projects.contains(c.projectId))
+            continue;  // two slugs pointing to the same project
+        if (c.resolved) {
+            projects.insert(c.projectId);
+            ++newOk;
+        }
+        m_resolved << c;
+    }
+
+    const int ok = resolvedCount();
+    if (m_target > 0 && ok < m_target && newOk > 0 && m_fillRound < 3) {
+        ++m_fillRound;
+        requestSuggestions(m_target - ok);
+        return;
+    }
+    showSuggestions();
+}
+
+void AIAssistantPage::showSuggestions(const QString& note)
+{
     m_modList->clear();
     int ok = 0;
-    for (int i = 0; i < candidates.size(); ++i) {
-        const auto& c = candidates[i];
-        auto item = new QListWidgetItem(m_modList);
-        item->setData(Qt::UserRole, i);
-        if (c.resolved) {
-            ++ok;
-            item->setText(c.reason.isEmpty() ? c.title : QStringLiteral("%1 — %2").arg(c.title, c.reason));
-            item->setToolTip(QStringLiteral("%1\n%2").arg(c.versionNumber, c.fileName));
-            item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
-            item->setCheckState(Qt::Checked);
-        } else {
-            item->setText(QStringLiteral("%1 — %2").arg(c.name.isEmpty() ? c.slug : c.name, c.error));
-            item->setFlags(Qt::NoItemFlags);
+    // available mods first, then the ones that could not be found (greyed out)
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i = 0; i < m_resolved.size(); ++i) {
+            const auto& c = m_resolved[i];
+            if (c.resolved != (pass == 0))
+                continue;
+            auto item = new QListWidgetItem(m_modList);
+            item->setData(Qt::UserRole, i);
+            if (c.resolved) {
+                ++ok;
+                item->setText(c.reason.isEmpty() ? c.title : QStringLiteral("%1 — %2").arg(c.title, c.reason));
+                item->setToolTip(QStringLiteral("%1\n%2").arg(c.versionNumber, c.fileName));
+                item->setFlags(Qt::ItemIsEnabled | Qt::ItemIsUserCheckable);
+                item->setCheckState(Qt::Checked);
+            } else {
+                item->setText(QStringLiteral("%1 — %2").arg(c.name.isEmpty() ? c.slug : c.name, c.error));
+                item->setFlags(Qt::NoItemFlags);
+            }
         }
     }
-    setBusy(false, tr("Найдено %1 из %2 модов для Minecraft %3. Снимите галочки с лишних и нажмите «Установить».")
-                       .arg(ok)
-                       .arg(candidates.size())
-                       .arg(mcVersion()));
+    QString status = m_target > 0 ? tr("Найдено %1 модов для Minecraft %2 (просили %3).").arg(ok).arg(mcVersion()).arg(m_target)
+                                  : tr("Найдено %1 модов для Minecraft %2.").arg(ok).arg(mcVersion());
+    if (m_target > 0 && ok < m_target)
+        status += tr(" Больше подходящих модов для этой версии ИИ не нашёл.");
+    if (!note.isEmpty())
+        status += QStringLiteral(" (%1)").arg(note);
+    setBusy(false, status + tr(" Снимите галочки с лишних и нажмите «Установить»."));
 }
 
 void AIAssistantPage::installSelected()

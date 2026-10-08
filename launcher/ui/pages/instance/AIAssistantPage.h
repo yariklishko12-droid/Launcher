@@ -60,8 +60,12 @@ class AIAssistantPage : public QWidget, public BasePage {
 
     // build
     void suggestMods();
+    void onCatalog(const QList<CatalogEntry>& entries);
+    void requestSuggestions(int count);
     void onSuggestions(const QString& text);
     void onResolved(const QList<ModCandidate>& candidates);
+    void showSuggestions(const QString& note = QString());
+    int resolvedCount() const;
     void installSelected();
     void startInstall(QList<ModCandidate> candidates, const QString& title);
     void onInstallFinished(const QStringList& installed, const QStringList& skipped, const QStringList& errors);
@@ -82,6 +86,12 @@ class AIAssistantPage : public QWidget, public BasePage {
     GeminiClient* m_ai;
     ModrinthInstaller* m_installer = nullptr;
     QList<ModCandidate> m_resolved;
+    // building a pack: catalogue of mods known to exist for this version, requested amount, top-up rounds
+    QList<CatalogEntry> m_catalog;
+    QString m_buildRequest;
+    int m_target = 0;
+    int m_fillRound = 0;
+    QSet<QString> m_triedSlugs;
     QList<QJsonObject> m_pendingInstallActions;
 
     QLabel* m_header;
