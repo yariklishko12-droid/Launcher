@@ -4,15 +4,19 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
+#include <QFutureWatcher>
+#include <QtConcurrent/QtConcurrentRun>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QSaveFile>
+#include <QRegularExpression>
 #include <QUrlQuery>
 
 #include "Application.h"
+#include "DependencyScanner.h"
 
 namespace {
 const QString API = QStringLiteral("https://api.modrinth.com/v2");
@@ -102,8 +106,9 @@ void ModrinthInstaller::resolveOne(ModCandidate candidate, std::function<void(Mo
         const auto status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
         const auto versions = QJsonDocument::fromJson(reply->readAll()).array();
         if (status == 404 || (reply->error() == QNetworkReply::NoError && versions.isEmpty())) {
-            // The slug may be hallucinated/outdated or has no build for this version: try one search by name.
-            if (!candidate.name.isEmpty()) {
+            // The slug may be hallucinated/outdated: try one search by name (only when the project does not exist,
+            // otherwise a search would silently pick a different mod that happens to support this version).
+            if (status == 404 && !candidate.name.isEmpty()) {
                 searchFallback(candidate, done);
                 return;
             }
@@ -175,6 +180,15 @@ void ModrinthInstaller::searchFallback(ModCandidate candidate, std::function<voi
             return;
         }
         const auto hit = hits.first().toObject();
+        if (candidate.isDependency) {
+            const auto norm = [](QString s) { return s.toLower().remove(QRegularExpression("[^a-z0-9]")); };
+            const auto want = norm(candidate.name), slug = norm(hit.value("slug").toString()), title = norm(hit.value("title").toString());
+            if (want.isEmpty() || !(slug == want || slug.contains(want) || want.contains(slug) || title.contains(want))) {
+                candidate.error = tr("не найден на Modrinth (возможно, есть только на CurseForge)");
+                done(candidate);
+                return;
+            }
+        }
         candidate.slug = hit.value("slug").toString();
         candidate.title = hit.value("title").toString();
         candidate.name.clear();  // prevents another fallback round
@@ -242,23 +256,37 @@ void ModrinthInstaller::install(QList<ModCandidate> candidates)
     m_installed.clear();
     m_skipped.clear();
     m_errors.clear();
+    m_attemptedDeps.clear();
+    m_depRounds = 0;
     m_queue = std::move(candidates);
     QDir().mkpath(m_modsDir);
     scanInstalled([this]() { installNext(); });
 }
 
+void ModrinthInstaller::finishInstall()
+{
+    m_busy = false;
+    emit installFinished(m_installed, m_skipped, m_errors);
+}
+
 void ModrinthInstaller::installNext()
 {
     if (m_queue.isEmpty()) {
-        m_busy = false;
-        emit installFinished(m_installed, m_skipped, m_errors);
+        if (m_depRounds < 4) {
+            ++m_depRounds;
+            checkJarDependencies();
+        } else {
+            finishInstall();
+        }
         return;
     }
     auto candidate = m_queue.takeFirst();
     if (!candidate.resolved) {
         resolveOne(candidate, [this](ModCandidate result) {
             if (!result.resolved) {
-                m_errors << QStringLiteral("%1: %2").arg(result.name.isEmpty() ? result.slug : result.name, result.error);
+                const auto who = result.name.isEmpty() ? result.slug : result.name;
+                m_errors << (result.requiredBy.isEmpty() ? QStringLiteral("%1: %2").arg(who, result.error)
+                                                         : tr("%1 (нужен для: %2): %3").arg(who, result.requiredBy, result.error));
                 installNext();
                 return;
             }
@@ -314,4 +342,52 @@ void ModrinthInstaller::download(ModCandidate candidate)
         }
         installNext();
     });
+}
+
+// ---------------------------------------------------------------- dependencies declared inside jars
+
+void ModrinthInstaller::checkJarDependencies()
+{
+    emit progress(tr("Проверяю зависимости внутри модов…"));
+    auto watcher = new QFutureWatcher<DependencyScanner::Result>(this);
+    connect(watcher, &QFutureWatcherBase::finished, this, [this, watcher]() {
+        watcher->deleteLater();
+        if (m_aborted)
+            return;
+        const auto result = watcher->result();
+        bool changed = false;
+        const QDir dir(m_modsDir);
+        for (auto it = result.missing.cbegin(); it != result.missing.cend(); ++it) {
+            const auto& id = it.key();
+            if (m_attemptedDeps.contains(id))
+                continue;
+            m_attemptedDeps.insert(id);
+            const auto requiredBy = it.value().join(", ");
+
+            if (result.disabledProviders.contains(id)) {
+                // The dependency is already there, just disabled: turn it back on instead of downloading a copy.
+                const auto file = result.disabledProviders.value(id);
+                if (QFile::rename(dir.filePath(file), dir.filePath(file.chopped(9)))) {
+                    m_installed << tr("%1 — включён обратно (нужен для: %2)").arg(file.chopped(9), requiredBy);
+                    changed = true;
+                }
+                continue;
+            }
+            ModCandidate dep;
+            dep.slug = DependencyScanner::modrinthSlugFor(id);
+            dep.name = id;
+            dep.title = id;
+            dep.isDependency = true;
+            dep.requiredBy = requiredBy;
+            m_queue << dep;
+            changed = true;
+        }
+        if (!changed) {
+            finishInstall();
+            return;
+        }
+        installNext();
+    });
+    const QString modsDir = m_modsDir;
+    watcher->setFuture(QtConcurrent::run([modsDir]() { return DependencyScanner::scan(modsDir); }));
 }

@@ -26,6 +26,7 @@ struct ModCandidate {
     QString sha1;
     QJsonArray dependencies;
     bool isDependency = false;
+    QString requiredBy;  // for dependencies found inside jars: which mods need it
 };
 
 class ModrinthInstaller : public QObject {
@@ -36,7 +37,9 @@ class ModrinthInstaller : public QObject {
 
     /** Looks every candidate up on Modrinth for this Minecraft version + loader. Emits resolved(). */
     void resolve(QList<ModCandidate> candidates);
-    /** Downloads candidates and their required dependencies, skipping already installed projects. Emits installFinished(). */
+    /** Downloads candidates and their required dependencies, skipping already installed projects.
+     *  Afterwards reads the jars and fetches dependencies that are declared only inside the mods.
+     *  Pass an empty list to only repair missing dependencies. Emits installFinished(). */
     void install(QList<ModCandidate> candidates);
     void abort();
     bool busy() const { return m_busy; }
@@ -55,6 +58,8 @@ class ModrinthInstaller : public QObject {
     void scanInstalled(std::function<void()> done);
     void installNext();
     void download(ModCandidate candidate);
+    void checkJarDependencies();
+    void finishInstall();
     QStringList loaderList() const;
 
     QString m_mcVersion;
@@ -67,5 +72,7 @@ class ModrinthInstaller : public QObject {
     QList<ModCandidate> m_queue;
     QList<ModCandidate> m_results;
     QSet<QString> m_installedProjects;
+    QSet<QString> m_attemptedDeps;
+    int m_depRounds = 0;
     QStringList m_installed, m_skipped, m_errors;
 };
