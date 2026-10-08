@@ -164,7 +164,7 @@ void AIPage::showProvider(const QString& id)
 {
     const auto p = GeminiClient::provider(id);
     m_shownProvider = p.id;
-    const auto data = m_edits.value(p.id).toObject();
+    const auto saved = m_edits.value(p.id).toObject();
 
     QString hint;
     if (p.id == "ollama" || p.id == "lmstudio")
@@ -178,12 +178,12 @@ void AIPage::showProvider(const QString& id)
     m_providerHint->setText(hint);
 
     m_form->setRowVisible(m_url, p.editableUrl);
-    m_url->setText(data.value("url").toString(p.baseUrl));
+    m_url->setText(saved.value("url").toString(p.baseUrl));
     m_key->setPlaceholderText(p.keyPlaceholder);
-    m_key->setText(data.value("key").toString());
+    m_key->setText(saved.value("key").toString());
 
     m_model->clear();
-    const auto model = data.value("model").toString();
+    const auto model = saved.value("model").toString();
     if (!model.isEmpty())
         m_model->addItem(model, model);
     m_model->lineEdit()->setPlaceholderText(tr("выберется автоматически"));
@@ -246,8 +246,8 @@ bool AIPage::apply()
 {
     storeEdits();
     for (const auto& p : GeminiClient::providers()) {
-        const auto data = m_edits.value(p.id).toObject();
-        GeminiClient::saveProvider(p.id, data.value("key").toString(), data.value("model").toString(), data.value("url").toString());
+        const auto saved = m_edits.value(p.id).toObject();
+        GeminiClient::saveProvider(p.id, saved.value("key").toString(), saved.value("model").toString(), saved.value("url").toString());
     }
     GeminiClient::setCurrentProvider(m_shownProvider);
     auto s = APPLICATION->settings();
