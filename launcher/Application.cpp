@@ -917,7 +917,9 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
         m_settings->registerSetting("GeminiApiKey", "");
         m_settings->registerSetting("GeminiModel", "gemini-2.5-flash");
         m_settings->registerSetting("AIProvider", "gemini");
-        m_settings->registerSetting("AIProviderData", "{}");  // JSON: provider id -> { key, model, url }
+        m_settings->registerSetting("AIProviderData", "{}");
+        m_settings->registerSetting("AIBigPacks", false);
+        m_settings->registerSetting("AISearchMode", 1);  // 0 popular, 1 mixed, 2 theme only  // JSON: provider id -> { key, model, url }
         m_settings->registerSetting("AIOfferOnCrash", true);
         m_settings->registerSetting("UIAnimations", true);
         m_settings->registerSetting("UserAgentOverride", "");
