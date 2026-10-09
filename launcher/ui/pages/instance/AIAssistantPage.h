@@ -15,6 +15,8 @@ class MinecraftInstance;
 class GeminiClient;
 class QLabel;
 class QListWidget;
+class QCheckBox;
+class QSlider;
 class QPlainTextEdit;
 class QProgressBar;
 class QPushButton;
@@ -61,6 +63,10 @@ class AIAssistantPage : public QWidget, public BasePage {
     // build
     void suggestMods();
     void onCatalog(const QList<CatalogEntry>& entries);
+    void onSearchPlan(const QString& text);
+    void continueOrFinish(int newOk);
+    void updateModeHint();
+    int batchSize() const;
     void requestSuggestions(int count);
     void onSuggestions(const QString& text);
     void onResolved(const QList<ModCandidate>& candidates);
@@ -76,7 +82,7 @@ class AIAssistantPage : public QWidget, public BasePage {
     QString modListText() const;
     QString collectLogs() const;
 
-    enum class Mode { Idle, Diagnose, Suggest };
+    enum class Mode { Idle, Diagnose, Suggest, Plan };
     Mode m_mode = Mode::Idle;
     void onAiFinished(const QString& text);
     void onAiFailed(const QString& error);
@@ -94,6 +100,12 @@ class AIAssistantPage : public QWidget, public BasePage {
     int m_catalogLimit = 400;  // catalogue entries sent to the AI (smaller for services with small limits)
     int m_lastCount = 0;       // amount asked for in the last suggestion request
     int m_shrink = 1;          // log size divisor for services with small limits
+    // 0 = popular mods, 1 = theme + popular, 2 = theme only
+    int m_searchMode = 1;
+    bool m_bigPack = false;
+    bool m_fillPopular = false;  // theme-only pack topped up with popular mods
+    enum class CatalogStage { Popular, Theme, MixedPopular, FillPopular };
+    CatalogStage m_catalogStage = CatalogStage::Popular;
     QSet<QString> m_triedSlugs;
     QList<QJsonObject> m_pendingInstallActions;
 
@@ -108,6 +120,9 @@ class AIAssistantPage : public QWidget, public BasePage {
     QPushButton* m_applyButton;
     QPlainTextEdit* m_request;
     QPushButton* m_suggestButton;
+    QCheckBox* m_bigPacks;
+    QSlider* m_modeSlider;
+    QLabel* m_modeHint;
     QTextBrowser* m_summary;
     QListWidget* m_modList;
     QPushButton* m_installButton;

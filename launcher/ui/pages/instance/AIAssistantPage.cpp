@@ -14,7 +14,10 @@
 #include <QJsonDocument>
 #include <QLabel>
 #include <QListWidget>
+#include <QCheckBox>
 #include <QMessageBox>
+#include <QSignalBlocker>
+#include <QSlider>
 #include <QPlainTextEdit>
 #include <QProgressBar>
 #include <QRegularExpression>
@@ -76,15 +79,33 @@ You get a CATALOGUE of mods that are guaranteed to have a build for this version
 (use their slugs exactly). You may add mods that are not in the catalogue only if you are sure they exist on Modrinth for this version.
 Never suggest mods from the "unavailable" list.
 Do NOT list pure library dependencies (Fabric API, Cloth Config, Architectury, etc.) unless the player asked for them: the launcher installs required dependencies automatically.
-If a number of mods is requested, return exactly that many (fill the rest with the best fitting quality-of-life, performance,
-content or decoration mods that match the theme).
+If a number of mods is requested, return exactly that many, never more (fill the rest with the best fitting quality-of-life,
+performance, content or decoration mods that match the theme).
+Catalogue lines may be tagged [theme] (found by searching the player's theme) or [popular] (popular, well tested mods).
+If the request says "ONLY theme mods", pick only mods that really match the theme.
 
 Respond ONLY with a JSON object:
 {
   "summary": "short description of the resulting pack, in Russian, Markdown allowed",
   "mods": [ {"slug": "<Modrinth project slug>", "name": "<display name>", "reason": "<very short reason in Russian, max 8 words>"} ]
 }
-At most 200 mods.)";
+)";
+
+const char* THEME_PROMPT = R"(You help a Minecraft: Java Edition modpack builder search Modrinth for mods that match a player's request
+(the request can be in any language).
+Respond ONLY with a JSON object:
+{
+  "categories": ["<Modrinth mod category>", ...],
+  "queries": ["<short English search phrase>", ...]
+}
+- categories: 1-6 categories that really match the request, chosen ONLY from: adventure, cursed, decoration, economy, equipment,
+  food, game-mechanics, magic, management, minigame, mobs, optimization, social, storage, technology, transportation, utility, worldgen.
+- queries: short ENGLISH search phrases (1-3 words): themes, mechanics, well-known mods or mod families that match the request
+  (e.g. "trains", "create addon", "dungeons", "spells", "furniture"). Do not add generic words like "mod" or "minecraft".)";
+
+const QStringList MODRINTH_CATEGORIES = { "adventure", "cursed",       "decoration", "economy",        "equipment", "food",
+                                          "game-mechanics", "magic",  "management", "minigame",       "mobs",      "optimization",
+                                          "social",    "storage",      "technology", "transportation", "utility",   "worldgen" };
 
 QString tail(const QString& text, int maxChars)
 {
@@ -239,6 +260,73 @@ void AIAssistantPage::buildUi()
     buildTop->addWidget(m_request, 1);
     buildTop->addWidget(m_suggestButton, 0, Qt::AlignTop);
     buildLayout->addLayout(buildTop);
+
+    // pack options: big packs + how the catalogue is collected
+    auto settings = APPLICATION->settings();
+    m_bigPacks = new QCheckBox(tr("Большие сборки (больше 200 модов)"), build);
+    m_bigPacks->setToolTip(tr("Снимает ограничение в 200 модов: сколько попросите, столько ИИ и постарается подобрать"));
+    m_bigPacks->setChecked(settings->get("AIBigPacks").toBool());
+    connect(m_bigPacks, &QCheckBox::toggled, this, [this](bool on) {
+        if (on) {
+            const auto answer = QMessageBox::warning(
+                this, tr("Большие сборки"),
+                tr("Режим больших сборок снимает ограничение в 200 модов.\n\n"
+                   "⚠ Учтите:\n"
+                   "• сборки на сотни модов чаще вылетают и конфликтуют, а чинить их сложнее;\n"
+                   "• игра дольше запускается и требует больше памяти (лучше выделить 8 ГБ и больше);\n"
+                   "• подбор идёт частями по 100 модов, занимает несколько минут и тратит больше лимита ИИ.\n\n"
+                   "Включить?"),
+                QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
+            if (answer != QMessageBox::Yes) {
+                QSignalBlocker blocker(m_bigPacks);
+                m_bigPacks->setChecked(false);
+                return;
+            }
+        }
+        APPLICATION->settings()->set("AIBigPacks", m_bigPacks->isChecked());
+    });
+
+    m_modeSlider = new QSlider(Qt::Horizontal, build);
+    m_modeSlider->setRange(0, 2);
+    m_modeSlider->setPageStep(1);
+    m_modeSlider->setTickPosition(QSlider::TicksBelow);
+    m_modeSlider->setTickInterval(1);
+    m_modeSlider->setFixedWidth(240);
+    m_modeSlider->setCursor(Qt::PointingHandCursor);
+    m_modeSlider->setValue(std::clamp(settings->get("AISearchMode").toInt(), 0, 2));
+    connect(m_modeSlider, &QSlider::valueChanged, this, [this](int value) {
+        APPLICATION->settings()->set("AISearchMode", value);
+        updateModeHint();
+    });
+    auto sliderBox = new QVBoxLayout();
+    sliderBox->setSpacing(0);
+    sliderBox->addWidget(m_modeSlider);
+    auto sliderLabels = new QHBoxLayout();
+    auto tickLabel = [build](const QString& text) {
+        auto label = new QLabel(QStringLiteral("<small>%1</small>").arg(text), build);
+        return label;
+    };
+    sliderLabels->addWidget(tickLabel(tr("Популярные")));
+    sliderLabels->addStretch(1);
+    sliderLabels->addWidget(tickLabel(tr("Смешанный")));
+    sliderLabels->addStretch(1);
+    sliderLabels->addWidget(tickLabel(tr("Только по теме")));
+    auto labelsWidget = new QWidget(build);
+    labelsWidget->setFixedWidth(240);
+    labelsWidget->setLayout(sliderLabels);
+    sliderLabels->setContentsMargins(0, 0, 0, 0);
+    sliderBox->addWidget(labelsWidget);
+
+    auto optionsRow = new QHBoxLayout();
+    optionsRow->addWidget(m_bigPacks, 0, Qt::AlignTop);
+    optionsRow->addStretch(1);
+    optionsRow->addWidget(new QLabel(tr("Какие моды искать:"), build), 0, Qt::AlignTop);
+    optionsRow->addLayout(sliderBox);
+    buildLayout->addLayout(optionsRow);
+    m_modeHint = new QLabel(build);
+    m_modeHint->setWordWrap(true);
+    buildLayout->addWidget(m_modeHint);
+    updateModeHint();
     buildLayout->addWidget(m_summary);
     buildLayout->addWidget(m_modList, 1);
     buildLayout->addWidget(m_installButton, 0, Qt::AlignRight);
@@ -288,6 +376,8 @@ void AIAssistantPage::setBusy(bool busy, const QString& status)
     m_analyzeButton->setEnabled(!busy);
     m_depsButton->setEnabled(!busy && !loader().isEmpty());
     m_suggestButton->setEnabled(!busy);
+    m_bigPacks->setEnabled(!busy);
+    m_modeSlider->setEnabled(!busy);
     m_applyButton->setEnabled(!busy && m_fixList->count() > 0);
     m_installButton->setEnabled(!busy && m_modList->count() > 0);
     m_progress->setVisible(busy);
@@ -304,6 +394,8 @@ void AIAssistantPage::onAiFinished(const QString& text)
         onDiagnosis(text);
     else if (mode == Mode::Suggest)
         onSuggestions(text);
+    else if (mode == Mode::Plan)
+        onSearchPlan(text);
 }
 
 void AIAssistantPage::onAiFailed(const QString& error)
@@ -622,6 +714,29 @@ void AIAssistantPage::applySelectedFixes()
 
 // ---------------------------------------------------------------- build
 
+void AIAssistantPage::updateModeHint()
+{
+    switch (m_modeSlider->value()) {
+        case 0:
+            m_modeHint->setText(tr("<small><b>Популярные</b> — самые проверенные моды под вашу версию. Сборка стабильнее всего.</small>"));
+            break;
+        case 1:
+            m_modeHint->setText(tr("<small><b>Смешанный</b> — моды, найденные по теме вашего запроса, плюс популярные проверенные. "
+                                   "Хороший баланс.</small>"));
+            break;
+        default:
+            m_modeHint->setText(tr("<small><span style='color:#f0a35e'>⚠ <b>Только по теме</b> — ИИ ищет моды по категориям и ключевым "
+                                   "словам вашего запроса. Будет больше нишевых и редких модов: они реже обновляются и хуже "
+                                   "проверены, поэтому выше риск конфликтов и вылетов.</span></small>"));
+            break;
+    }
+}
+
+int AIAssistantPage::batchSize() const
+{
+    return m_bigPack ? 100 : 200;
+}
+
 void AIAssistantPage::suggestMods()
 {
     if (m_mode != Mode::Idle || (m_installer && m_installer->busy()))
@@ -641,40 +756,152 @@ void AIAssistantPage::suggestMods()
         m_status->setText(tr("Сначала выберите нейросеть и добавьте её ключ в «Настройки → ИИ-помощник»."));
         return;
     }
+
+    // "сборку на 100 модов", "100 mods", "50 шт" -> the AI is asked for exactly that many and tops the list up.
+    int target = 0;
+    static const QRegularExpression amount(QStringLiteral(R"((\d{1,5})\s*(мод|mod|шт))"), QRegularExpression::CaseInsensitiveOption);
+    const auto match = amount.match(request);
+    if (match.hasMatch())
+        target = std::max(1, match.captured(1).toInt());
+
+    if (target > 200 && !m_bigPacks->isChecked()) {
+        const auto answer = QMessageBox::question(
+            this, tr("Большая сборка"),
+            tr("Вы просите %1 модов, а без режима «Большие сборки» максимум 200.\n\n"
+               "⚠ Сборки на сотни модов чаще вылетают и конфликтуют, дольше запускаются, требуют больше памяти (лучше 8 ГБ и больше), "
+               "а подбор занимает несколько минут и тратит больше лимита ИИ.\n\n"
+               "Включить режим больших сборок? «Нет» — подобрать 200 модов.")
+                .arg(target),
+            QMessageBox::Yes | QMessageBox::No | QMessageBox::Cancel, QMessageBox::No);
+        if (answer == QMessageBox::Cancel)
+            return;
+        if (answer == QMessageBox::Yes) {
+            QSignalBlocker blocker(m_bigPacks);
+            m_bigPacks->setChecked(true);
+            APPLICATION->settings()->set("AIBigPacks", true);
+        } else {
+            target = 200;
+        }
+    }
+    m_bigPack = m_bigPacks->isChecked();
+    m_searchMode = m_modeSlider->value();
+
+    if (target > 300) {
+        const int requests = (target + 99) / 100 + (m_searchMode > 0 ? 1 : 0) + 2;
+        const int minMinutes = std::max(1, (requests * 20 + target / 6) / 60);
+        const int maxMinutes = std::max(minMinutes + 1, (requests * 60 + target / 3) / 60);
+        const auto answer = QMessageBox::question(
+            this, tr("Большая сборка"),
+            tr("Подбор %1 модов займёт примерно %2–%3 мин и потратит около %4 запросов к %5.\n\n"
+               "Если у сервиса закончится лимит, подбор остановится на том, что уже найдено. Продолжить?")
+                .arg(target)
+                .arg(minMinutes)
+                .arg(maxMinutes)
+                .arg(requests)
+                .arg(GeminiClient::provider().name));
+        if (answer != QMessageBox::Yes)
+            return;
+    }
+
     m_modList->clear();
     m_summary->clear();
     m_resolved.clear();
     m_catalog.clear();
     m_triedSlugs.clear();
     m_fillRound = 0;
+    m_fillPopular = false;
     m_buildRequest = request;
-
-    // "сборку на 100 модов", "100 mods", "50 шт" -> the AI is asked for exactly that many and tops the list up.
-    m_target = 0;
-    static const QRegularExpression amount(QStringLiteral(R"((\d{1,3})\s*(мод|mod|шт))"), QRegularExpression::CaseInsensitiveOption);
-    const auto match = amount.match(request);
-    if (match.hasMatch())
-        m_target = std::clamp(match.captured(1).toInt(), 1, 200);
+    m_target = target;
 
     const int budget = GeminiClient::provider().catalogSize;
     m_catalogLimit = std::min(600, m_target > 60 ? budget * 3 / 2 : budget);
     recreateInstaller();
-    setBusy(true, tr("Загружаю список модов, доступных для Minecraft %1…").arg(mcVersion()));
-    m_installer->fetchCatalog(m_catalogLimit);
+
+    if (m_searchMode == 0) {
+        m_catalogStage = CatalogStage::Popular;
+        setBusy(true, tr("Загружаю популярные моды для Minecraft %1…").arg(mcVersion()));
+        m_installer->fetchCatalog(std::min(5000, std::max(m_catalogLimit, m_bigPack ? m_target * 2 : 0)));
+        return;
+    }
+    // theme search: the AI first turns the request into Modrinth categories and English search phrases
+    m_mode = Mode::Plan;
+    setBusy(true, tr("ИИ разбирает тему сборки…"));
+    const int queries = m_bigPack && m_target > 200 ? 25 : 12;
+    m_ai->generate(THEME_PROMPT,
+                   QStringLiteral("Player request: %1\nMinecraft: %2\nMod loader: %3\nGive up to %4 queries.")
+                       .arg(request, mcVersion(), loader())
+                       .arg(queries),
+                   true);
+}
+
+void AIAssistantPage::onSearchPlan(const QString& text)
+{
+    const auto json = GeminiClient::parseJsonObject(text);
+    QStringList categories, queries;
+    for (const auto& v : json.value("categories").toArray()) {
+        const auto c = v.toString().trimmed().toLower();
+        if (MODRINTH_CATEGORIES.contains(c) && !categories.contains(c))
+            categories << c;
+    }
+    for (const auto& v : json.value("queries").toArray()) {
+        const auto q = v.toString().simplified();
+        if (!q.isEmpty() && q.size() <= 60 && !queries.contains(q, Qt::CaseInsensitive))
+            queries << q;
+    }
+    if (categories.isEmpty() && queries.isEmpty()) {
+        // could not understand the theme: fall back to popular mods instead of failing
+        m_catalogStage = CatalogStage::Popular;
+        setBusy(true, tr("Тему разобрать не удалось, беру популярные моды…"));
+        m_installer->fetchCatalog(std::min(5000, std::max(m_catalogLimit, m_bigPack ? m_target * 2 : 0)));
+        return;
+    }
+    m_catalogStage = CatalogStage::Theme;
+    setBusy(true, tr("Ищу моды по теме: %1…").arg(QStringList(queries.mid(0, 6) + categories).join(", ")));
+    const int pages = m_bigPack ? std::clamp(m_target / 400 + 1, 1, 4) : 1;
+    m_installer->fetchThemeCatalog(queries.mid(0, 25), categories, pages);
 }
 
 void AIAssistantPage::onCatalog(const QList<CatalogEntry>& entries)
 {
-    m_catalog = entries;
-    requestSuggestions(m_target);
+    switch (m_catalogStage) {
+        case CatalogStage::Popular:
+            m_catalog = entries;
+            break;
+        case CatalogStage::Theme:
+            m_catalog = entries;
+            for (auto& e : m_catalog)
+                e.thematic = true;
+            if (m_searchMode == 1) {
+                m_catalogStage = CatalogStage::MixedPopular;
+                setBusy(true, tr("Найдено модов по теме: %1. Добавляю популярные…").arg(m_catalog.size()));
+                m_installer->fetchCatalog(std::min(5000, std::max(m_catalogLimit / 2, m_bigPack ? m_target : 0)));
+                return;
+            }
+            break;
+        case CatalogStage::MixedPopular:
+        case CatalogStage::FillPopular: {
+            QSet<QString> known;
+            for (const auto& e : m_catalog)
+                known.insert(e.slug);
+            for (const auto& e : entries) {
+                if (!known.contains(e.slug))
+                    m_catalog << e;
+            }
+            break;
+        }
+    }
+    const int ok = resolvedCount();
+    requestSuggestions(m_target > 0 ? std::min(batchSize(), m_target - ok) : 0);
 }
 
 void AIAssistantPage::requestSuggestions(int count)
 {
     QStringList chosen;
+    QSet<QString> used = m_triedSlugs;
     for (const auto& c : m_resolved) {
         if (c.resolved)
             chosen << QStringLiteral("%1 (%2)").arg(c.title, c.slug);
+        used.insert(c.slug.toLower());
     }
     QStringList unavailable;
     for (const auto& c : m_resolved) {
@@ -682,31 +909,56 @@ void AIAssistantPage::requestSuggestions(int count)
             unavailable << (c.slug.isEmpty() ? c.name : c.slug);
     }
     m_lastCount = count;
+
+    // only catalogue entries that were not suggested yet; in the mixed mode keep both kinds in the slice
+    QList<CatalogEntry> theme, popular;
+    for (const auto& e : m_catalog) {
+        if (!used.contains(e.slug.toLower()))
+            (e.thematic ? theme : popular) << e;
+    }
+    QList<CatalogEntry> slice;
+    const bool themeOnly = m_searchMode == 2 && !m_fillPopular;
+    if (themeOnly) {
+        slice = theme.mid(0, m_catalogLimit);
+    } else if (m_fillPopular) {
+        slice = popular.mid(0, m_catalogLimit);
+    } else {
+        const int themePart = popular.isEmpty() ? m_catalogLimit : std::min(int(theme.size()), m_catalogLimit * 3 / 5);
+        slice = theme.mid(0, themePart) + popular.mid(0, m_catalogLimit - themePart);
+    }
+    const bool tagged = m_searchMode > 0;
     QStringList catalogue;
-    for (const auto& e : m_catalog.mid(0, m_catalogLimit))
-        catalogue << QStringLiteral("%1 | %2 | %3 | %4").arg(e.slug, e.title, e.categories.join(','), e.description);
+    for (const auto& e : slice)
+        catalogue << QStringLiteral("%1%2 | %3 | %4 | %5")
+                         .arg(tagged ? (e.thematic ? "[theme] " : "[popular] ") : "", e.slug, e.title, e.categories.join(','), e.description);
 
     QString amountText;
     if (count > 0 && m_fillRound > 0)
         amountText = QStringLiteral("Suggest exactly %1 MORE mods (in addition to the already chosen ones).").arg(count);
+    else if (count > 0 && m_target > count)
+        amountText = QStringLiteral("The pack will have %1 mods, chosen in parts. Return exactly %2 mods now.").arg(m_target).arg(count);
     else if (count > 0)
         amountText = QStringLiteral("The player wants %1 mods: return exactly %1.").arg(count);
     else
         amountText = QStringLiteral("Choose a sensible amount (usually 20-50) for this request.");
+    if (themeOnly)
+        amountText += QStringLiteral(" ONLY theme mods: pick only mods that really match the request.");
+    else if (m_fillPopular)
+        amountText += QStringLiteral(" The theme mods ran out: fill the rest with the best popular mods that suit the request.");
 
     const QString prompt = QStringLiteral(
                                "Player request: %1\n\nMinecraft: %2\nMod loader: %3\n%4\n\nAlready installed:\n%5\n\n"
                                "Already chosen (do not repeat):\n%6\n\nUnavailable for this version (never suggest):\n%7\n\n"
-                               "CATALOGUE (slug | name | categories | description), sorted by popularity:\n%8")
+                               "CATALOGUE (slug | name | categories | description), best matches first:\n%8")
                                .arg(m_buildRequest, mcVersion(), loader(), amountText, modListText(),
                                     chosen.isEmpty() ? QStringLiteral("(none)") : chosen.join('\n'),
                                     unavailable.isEmpty() ? QStringLiteral("(none)") : unavailable.join(", "),
                                     catalogue.isEmpty() ? QStringLiteral("(not available — pick from your own knowledge)") : catalogue.join('\n'));
     m_mode = Mode::Suggest;
     if (m_fillRound == 0)
-        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(std::min(int(m_catalog.size()), m_catalogLimit)));
+        setBusy(true, tr("ИИ подбирает моды (в каталоге %1 подходящих)…").arg(slice.size()));
     else
-        setBusy(true, tr("Найдено %1 из %2. ИИ добирает ещё %3…").arg(resolvedCount()).arg(m_target).arg(count));
+        setBusy(true, tr("Найдено %1 из %2. ИИ подбирает ещё %3…").arg(resolvedCount()).arg(m_target).arg(count));
     m_ai->generate(BUILD_PROMPT, prompt, true);
 }
 
@@ -739,7 +991,7 @@ void AIAssistantPage::onSuggestions(const QString& text)
     }
     if (candidates.isEmpty()) {
         if (resolvedCount() > 0)
-            showSuggestions();
+            continueOrFinish(0);
         else
             setBusy(false, tr("ИИ не предложил ни одного мода. Попробуйте описать запрос иначе."));
         return;
@@ -775,11 +1027,37 @@ void AIAssistantPage::onResolved(const QList<ModCandidate>& candidates)
         m_resolved << c;
     }
 
+    continueOrFinish(newOk);
+}
+
+void AIAssistantPage::continueOrFinish(int newOk)
+{
     const int ok = resolvedCount();
-    if (m_target > 0 && ok < m_target && newOk > 0 && m_fillRound < 3) {
+    const int maxRounds = (m_target + batchSize() - 1) / batchSize() + 3;  // the parts + a few top-ups
+    if (m_target > 0 && ok < m_target && newOk > 0 && m_fillRound < maxRounds) {
         ++m_fillRound;
-        requestSuggestions(m_target - ok);
+        requestSuggestions(std::min(batchSize(), m_target - ok));
         return;
+    }
+    if (m_target > 0 && ok < m_target && m_searchMode == 2 && !m_fillPopular) {
+        // theme-only pack is short: the player decides whether to fill it with popular mods
+        QMessageBox box(QMessageBox::Question, tr("Не хватило модов по теме"),
+                        tr("Нашлось %1 модов на вашу тему из %2.\n\nДобрать недостающие популярными модами, которые подходят к сборке?")
+                            .arg(ok)
+                            .arg(m_target),
+                        QMessageBox::NoButton, this);
+        auto fill = box.addButton(tr("Добрать популярными"), QMessageBox::AcceptRole);
+        box.addButton(tr("Оставить %1").arg(ok), QMessageBox::RejectRole);
+        box.exec();
+        if (box.clickedButton() == fill) {
+            m_fillPopular = true;
+            m_fillRound = 0;
+            m_catalogStage = CatalogStage::FillPopular;
+            recreateInstaller();
+            setBusy(true, tr("Загружаю популярные моды, чтобы добрать сборку…"));
+            m_installer->fetchCatalog(std::min(5000, std::max(m_catalogLimit, (m_target - ok) * 2 + int(m_triedSlugs.size()))));
+            return;
+        }
     }
     showSuggestions();
 }
@@ -810,7 +1088,7 @@ void AIAssistantPage::showSuggestions(const QString& note)
     }
     QString status = m_target > 0 ? tr("Найдено %1 модов для Minecraft %2 (просили %3).").arg(ok).arg(mcVersion()).arg(m_target)
                                   : tr("Найдено %1 модов для Minecraft %2.").arg(ok).arg(mcVersion());
-    if (m_target > 0 && ok < m_target)
+    if (m_target > 0 && ok < m_target && !(m_searchMode == 2 && !m_fillPopular))
         status += tr(" Больше подходящих модов для этой версии ИИ не нашёл.");
     if (!note.isEmpty())
         status += QStringLiteral(" (%1)").arg(note);
