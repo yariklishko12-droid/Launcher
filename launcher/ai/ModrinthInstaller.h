@@ -36,6 +36,7 @@ struct CatalogEntry {
     QString description;
     QStringList categories;
     int downloads = 0;
+    bool thematic = false;  // found by a theme search (set by the caller)
 };
 
 class ModrinthInstaller : public QObject {
@@ -48,6 +49,8 @@ class ModrinthInstaller : public QObject {
     void resolve(QList<ModCandidate> candidates);
     /** Loads the most popular mods that support this Minecraft version + loader (libraries excluded). Emits catalogReady(). */
     void fetchCatalog(int maxEntries);
+    /** Searches Modrinth by English phrases and categories (only mods for this version + loader). Emits catalogReady(). */
+    void fetchThemeCatalog(const QStringList& queries, const QStringList& categories, int pagesPerSearch);
     /** Downloads candidates and their required dependencies, skipping already installed projects.
      *  Afterwards reads the jars and fetches dependencies that are declared only inside the mods.
      *  Pass an empty list to only repair missing dependencies. Emits installFinished(). */
@@ -67,7 +70,13 @@ class ModrinthInstaller : public QObject {
     void resolveOne(ModCandidate candidate, std::function<void(ModCandidate)> done);
     void searchFallback(ModCandidate candidate, std::function<void(ModCandidate)> done);
     void resolveNext();
-    void fetchCatalogPage(int offset, int maxEntries);
+    struct CatalogJob {
+        QUrl url;
+        int group;  // pages of one search; a short page ends its group
+    };
+    QUrl searchUrl(const QString& query, const QString& category, const QString& index, int offset) const;
+    void startCatalog(QList<CatalogJob> jobs);
+    void runCatalogJob();
     void scanInstalled(std::function<void()> done);
     void installNext();
     void download(ModCandidate candidate);
@@ -87,6 +96,10 @@ class ModrinthInstaller : public QObject {
     int m_resolveIndex = 0;
     int m_resolveActive = 0;
     QList<CatalogEntry> m_catalog;
+    QSet<QString> m_catalogSlugs;
+    QList<CatalogJob> m_catalogJobs;
+    QSet<int> m_finishedGroups;
+    int m_catalogJobsTotal = 0;
     QSet<QString> m_installedProjects;
     QSet<QString> m_attemptedDeps;
     int m_depRounds = 0;

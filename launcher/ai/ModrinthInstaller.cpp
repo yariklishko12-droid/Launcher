@@ -239,30 +239,75 @@ void ModrinthInstaller::resolveNext()
     });
 }
 
+QUrl ModrinthInstaller::searchUrl(const QString& query, const QString& category, const QString& index, int offset) const
+{
+    QUrl url(API + "/search");
+    QUrlQuery q;
+    if (!query.isEmpty())
+        q.addQueryItem("query", query);
+    q.addQueryItem("index", index);
+    q.addQueryItem("limit", "100");
+    q.addQueryItem("offset", QString::number(offset));
+    QJsonArray loaders;
+    for (const auto& l : loaderList())
+        loaders.append("categories:" + l);
+    QJsonArray facets{ QJsonArray{ "project_type:mod" }, QJsonArray{ "versions:" + m_mcVersion }, loaders };
+    if (!category.isEmpty())
+        facets.append(QJsonArray{ "categories:" + category });
+    q.addQueryItem("facets", QString::fromUtf8(QJsonDocument(facets).toJson(QJsonDocument::Compact)));
+    url.setQuery(q);
+    return url;
+}
+
 void ModrinthInstaller::fetchCatalog(int maxEntries)
+{
+    QList<CatalogJob> jobs;
+    for (int offset = 0; offset < std::max(100, maxEntries); offset += 100)
+        jobs << CatalogJob{ searchUrl({}, {}, "downloads", offset), 0 };
+    startCatalog(jobs);
+}
+
+void ModrinthInstaller::fetchThemeCatalog(const QStringList& queries, const QStringList& categories, int pagesPerSearch)
+{
+    QList<CatalogJob> jobs;
+    int group = 0;
+    // pages are interleaved (page 1 of every search, then page 2 ...) so the best matches of every search come first
+    for (int page = 0; page < std::max(1, pagesPerSearch); ++page) {
+        group = 0;
+        for (const auto& query : queries)
+            jobs << CatalogJob{ searchUrl(query, {}, "relevance", page * 100), group++ };
+        for (const auto& category : categories)
+            jobs << CatalogJob{ searchUrl({}, category, "downloads", page * 100), group++ };
+    }
+    startCatalog(jobs);
+}
+
+void ModrinthInstaller::startCatalog(QList<CatalogJob> jobs)
 {
     m_aborted = false;
     m_busy = true;
     m_catalog.clear();
-    fetchCatalogPage(0, maxEntries);
+    m_catalogSlugs.clear();
+    m_finishedGroups.clear();
+    m_catalogJobs = std::move(jobs);
+    m_catalogJobsTotal = m_catalogJobs.size();
+    runCatalogJob();
 }
 
-void ModrinthInstaller::fetchCatalogPage(int offset, int maxEntries)
+void ModrinthInstaller::runCatalogJob()
 {
-    emit progress(tr("Загружаю список модов для Minecraft %1 (%2)… %3").arg(m_mcVersion, m_loader).arg(m_catalog.size()));
-    QUrl url(API + "/search");
-    QUrlQuery query;
-    query.addQueryItem("index", "downloads");
-    query.addQueryItem("limit", "100");
-    query.addQueryItem("offset", QString::number(offset));
-    QJsonArray loaders;
-    for (const auto& l : loaderList())
-        loaders.append("categories:" + l);
-    const QJsonArray facets{ QJsonArray{ "project_type:mod" }, QJsonArray{ "versions:" + m_mcVersion }, loaders };
-    query.addQueryItem("facets", QString::fromUtf8(QJsonDocument(facets).toJson(QJsonDocument::Compact)));
-    url.setQuery(query);
-
-    request(url, [this, offset, maxEntries](QNetworkReply* reply) {
+    while (!m_catalogJobs.isEmpty() && m_finishedGroups.contains(m_catalogJobs.first().group))
+        m_catalogJobs.removeFirst();
+    if (m_catalogJobs.isEmpty()) {
+        m_busy = false;
+        emit catalogReady(m_catalog);  // an empty catalogue is not fatal: the AI then picks from memory
+        return;
+    }
+    const auto job = m_catalogJobs.takeFirst();
+    emit progress(tr("Ищу моды на Modrinth для Minecraft %1 (%2)… найдено %3")
+                      .arg(m_mcVersion, m_loader)
+                      .arg(m_catalog.size()));
+    request(job.url, [this, job](QNetworkReply* reply) {
         const auto root = QJsonDocument::fromJson(reply->readAll()).object();
         const auto hits = root.value("hits").toArray();
         if (reply->error() == QNetworkReply::NoError) {
@@ -286,18 +331,15 @@ void ModrinthInstaller::fetchCatalogPage(int offset, int maxEntries)
                 entry.description = hit.value("description").toString().simplified().left(90);
                 entry.categories = categories;
                 entry.downloads = hit.value("downloads").toInt();
-                if (!entry.slug.isEmpty())
+                if (!entry.slug.isEmpty() && !m_catalogSlugs.contains(entry.slug)) {
+                    m_catalogSlugs.insert(entry.slug);
                     m_catalog << entry;
+                }
             }
         }
-        const int total = root.value("total_hits").toInt();
-        const int next = offset + 100;
-        if (reply->error() == QNetworkReply::NoError && !hits.isEmpty() && next < total && next < maxEntries) {
-            fetchCatalogPage(next, maxEntries);
-            return;
-        }
-        m_busy = false;
-        emit catalogReady(m_catalog);  // an empty catalog is not fatal: the AI then picks from memory
+        if (reply->error() != QNetworkReply::NoError || hits.size() < 100)
+            m_finishedGroups.insert(job.group);  // no more pages for this search
+        runCatalogJob();
     });
 }
 
