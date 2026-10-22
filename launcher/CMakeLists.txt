@@ -328,6 +328,9 @@ set(MINECRAFT_SOURCES
     minecraft/MojangDownloadInfo.h
     minecraft/VanillaInstanceCreationTask.cpp
     minecraft/VanillaInstanceCreationTask.h
+    minecraft/fpsboost/FpsBoost.h
+    minecraft/fpsboost/FpsBoost.cpp
+    minecraft/fpsboost/FpsBoostManifest.cpp
     minecraft/VersionFile.cpp
     minecraft/VersionFile.h
     minecraft/VersionFilterData.h

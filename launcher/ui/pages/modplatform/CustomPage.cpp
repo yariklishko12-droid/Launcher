@@ -37,6 +37,7 @@
 #include "ui_CustomPage.h"
 
 #include <QTabBar>
+#include <QSignalBlocker>
 
 #include "Application.h"
 #include "Filter.h"
@@ -49,6 +50,16 @@
 CustomPage::CustomPage(NewInstanceDialog* dialog, QWidget* parent) : QWidget(parent), dialog(dialog), ui(new Ui::CustomPage)
 {
     ui->setupUi(this);
+    m_fpsTimer = new QTimer(this);
+    m_fpsTimer->setSingleShot(true);
+    m_fpsTimer->setInterval(500);
+    connect(m_fpsTimer, &QTimer::timeout, this, &CustomPage::checkFpsBoost);
+    connect(ui->fpsBoostToggle, &QCheckBox::toggled, this, &CustomPage::suggestCurrent);
+    connect(ui->fpsBoostRetry, &QPushButton::clicked, this, [this] {
+        m_fpsKey.clear();
+        suggestCurrent();
+    });
+    ui->fpsBoostRetry->hide();
     connect(ui->versionList, &VersionSelectWidget::selectedVersionChanged, this, &CustomPage::setSelectedVersion);
     filterChanged();
     connect(ui->alphaFilter, &QCheckBox::stateChanged, this, &CustomPage::filterChanged);
@@ -60,6 +71,7 @@ CustomPage::CustomPage(NewInstanceDialog* dialog, QWidget* parent) : QWidget(par
 
     connect(ui->loaderVersionList, &VersionSelectWidget::selectedVersionChanged, this, &CustomPage::setSelectedLoaderVersion);
     connect(ui->noneFilter, &QRadioButton::toggled, this, &CustomPage::loaderFilterChanged);
+    connect(ui->neoForgeFilter, &QRadioButton::toggled, this, &CustomPage::loaderFilterChanged);
     connect(ui->forgeFilter, &QRadioButton::toggled, this, &CustomPage::loaderFilterChanged);
     connect(ui->fabricFilter, &QRadioButton::toggled, this, &CustomPage::loaderFilterChanged);
     connect(ui->quiltFilter, &QRadioButton::toggled, this, &CustomPage::loaderFilterChanged);
@@ -109,6 +121,8 @@ void CustomPage::filterChanged()
 
 void CustomPage::loaderFilterChanged()
 {
+    m_selectedLoader.clear();
+    m_selectedLoaderVersion.reset();
     QString minecraftVersion;
     if (m_selectedVersion) {
         minecraftVersion = m_selectedVersion->descriptor();
@@ -116,12 +130,14 @@ void CustomPage::loaderFilterChanged()
         ui->loaderVersionList->setExactFilter(BaseVersionList::ParentVersionRole, "AAA");  // empty list
         ui->loaderVersionList->setEmptyString(tr("No Minecraft version is selected."));
         ui->loaderVersionList->setEmptyMode(VersionListView::String);
+        suggestCurrent();
         return;
     }
     if (ui->noneFilter->isChecked()) {
         ui->loaderVersionList->setExactFilter(BaseVersionList::ParentVersionRole, "AAA");  // empty list
         ui->loaderVersionList->setEmptyString(tr("No mod loader is selected."));
         ui->loaderVersionList->setEmptyMode(VersionListView::String);
+        suggestCurrent();
         return;
     } else if (ui->neoForgeFilter->isChecked()) {
         ui->loaderVersionList->setExactFilter(BaseVersionList::ParentVersionRole, minecraftVersion);
@@ -152,10 +168,17 @@ void CustomPage::loaderFilterChanged()
     ui->loaderVersionList->initialize(vlist.get());
     ui->loaderVersionList->selectRecommended();
     ui->loaderVersionList->setEmptyString(tr("No versions are currently available for Minecraft %1").arg(minecraftVersion));
+    m_selectedLoaderVersion = ui->loaderVersionList->selectedVersion();
+    suggestCurrent();
 }
 
 CustomPage::~CustomPage()
 {
+    m_fpsTimer->stop();
+    if (m_fpsTask) {
+        disconnect(m_fpsTask.get(), nullptr, this, nullptr);
+        m_fpsTask->abort();
+    }
     delete ui;
 }
 
@@ -191,24 +214,26 @@ void CustomPage::suggestCurrent()
     }
 
     if (!m_selectedVersion) {
+        refreshFpsBoost();
         dialog->setSuggestedPack();
         return;
     }
 
-    // There isn't a selected version if the version list is empty
-    if (ui->loaderVersionList->selectedVersion() == nullptr)
-        dialog->setSuggestedPack(m_selectedVersion->descriptor(), new VanillaCreationTask(m_selectedVersion));
-    else {
-        dialog->setSuggestedPack(m_selectedVersion->descriptor(),
-                                 new VanillaCreationTask(m_selectedVersion, m_selectedLoader, m_selectedLoaderVersion));
-    }
+    refreshFpsBoost();
+    VanillaCreationTask* task;
+    if (m_selectedLoader.isEmpty() || !m_selectedLoaderVersion)
+        task = new VanillaCreationTask(m_selectedVersion);
+    else
+        task = new VanillaCreationTask(m_selectedVersion, m_selectedLoader, m_selectedLoaderVersion);
+    if (ui->fpsBoostToggle->isEnabled() && ui->fpsBoostToggle->isChecked())
+        task->setFpsBoostPlan(m_fpsPlan);
+    dialog->setSuggestedPack(m_selectedVersion->descriptor(), task);
     dialog->setSuggestedIcon("default");
 }
 
 void CustomPage::setSelectedVersion(BaseVersion::Ptr version)
 {
     m_selectedVersion = version;
-    suggestCurrent();
     loaderFilterChanged();
 }
 
@@ -216,4 +241,65 @@ void CustomPage::setSelectedLoaderVersion(BaseVersion::Ptr version)
 {
     m_selectedLoaderVersion = version;
     suggestCurrent();
+}
+
+void CustomPage::refreshFpsBoost()
+{
+    const auto loader = FpsBoost::apiLoader(m_selectedLoader);
+    const auto key = m_selectedVersion && m_selectedLoaderVersion && !loader.isEmpty()
+                         ? m_selectedVersion->descriptor() + "/" + loader + "/" + m_selectedLoaderVersion->descriptor()
+                         : QString("unsupported");
+    if (key == m_fpsKey) return;
+    m_fpsKey = key;
+    m_fpsTimer->stop();
+    if (m_fpsTask) {
+        disconnect(m_fpsTask.get(), nullptr, this, nullptr);
+        m_fpsTask->abort();
+        m_fpsTask.reset();
+    }
+    m_fpsPlan = {};
+    // Block the toggled callback while invalidating: it otherwise rebuilds the creation task recursively.
+    const QSignalBlocker blocked(ui->fpsBoostToggle);
+    ui->fpsBoostToggle->setChecked(false);
+    ui->fpsBoostToggle->setEnabled(false);
+    ui->fpsBoostToggle->setToolTip(QString());
+    ui->fpsBoostStatus->setToolTip(QString());
+    ui->fpsBoostRetry->hide();
+    if (key == "unsupported") {
+        ui->fpsBoostStatus->setText(tr("Выберите Minecraft и поддерживаемый загрузчик модов."));
+        return;
+    }
+    ui->fpsBoostStatus->setText(tr("Проверка совместимых модов и требований к загрузчику…"));
+    m_fpsTimer->start();
+}
+
+void CustomPage::checkFpsBoost()
+{
+    if (!m_selectedVersion || !m_selectedLoaderVersion) return;
+    const auto key = m_fpsKey;
+    m_fpsTask = makeShared<FpsBoost::ResolveTask>(m_selectedVersion->descriptor(),
+                                               FpsBoost::apiLoader(m_selectedLoader), m_selectedLoaderVersion->descriptor());
+    connect(m_fpsTask.get(), &Task::status, this, [this, key](const QString& text) {
+        if (key == m_fpsKey) ui->fpsBoostStatus->setText(text);
+    });
+    connect(m_fpsTask.get(), &Task::succeeded, this, [this, key] {
+        if (key != m_fpsKey) return;
+        m_fpsPlan = m_fpsTask->plan();
+        const auto available = !m_fpsPlan.files.isEmpty();
+        ui->fpsBoostToggle->setEnabled(available);
+        QStringList names;
+        for (const auto& file : m_fpsPlan.files) names.append(file.label);
+        ui->fpsBoostToggle->setToolTip(names.join("\n"));
+        ui->fpsBoostStatus->setText(available ? tr("Готово к установке: %1 модов (включая зависимости).").arg(m_fpsPlan.files.size())
+                                             : tr("Для этой версии Minecraft и загрузчика нет проверенного совместимого набора."));
+        ui->fpsBoostRetry->show();
+        suggestCurrent();
+    });
+    connect(m_fpsTask.get(), &Task::failed, this, [this, key](const QString& reason) {
+        if (key != m_fpsKey) return;
+        ui->fpsBoostStatus->setText(tr("Не удалось проверить моды. Проверьте интернет и повторите."));
+        ui->fpsBoostStatus->setToolTip(reason);
+        ui->fpsBoostRetry->show();
+    });
+    m_fpsTask->start();
 }

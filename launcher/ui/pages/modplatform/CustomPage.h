@@ -39,6 +39,8 @@
 
 #include "BaseVersion.h"
 #include "tasks/Task.h"
+#include "minecraft/fpsboost/FpsBoost.h"
+#include <QTimer>
 #include "ui/pages/BasePage.h"
 
 namespace Ui {
@@ -78,8 +80,14 @@ class CustomPage : public QWidget, public BasePage {
     void refresh();
     void loaderRefresh();
     void suggestCurrent();
+    void refreshFpsBoost();
+    void checkFpsBoost();
 
    private:
+    QTimer* m_fpsTimer = nullptr;
+    shared_qobject_ptr<FpsBoost::ResolveTask> m_fpsTask;
+    FpsBoost::Plan m_fpsPlan;
+    QString m_fpsKey;
     bool initialized = false;
     NewInstanceDialog* dialog = nullptr;
     Ui::CustomPage* ui = nullptr;
